@@ -1,0 +1,11 @@
+[package]
+name = "crudis"
+version = "0.1.0"
+authors = ["Gregory Meyer <me@gregjm.dev>"]
+edition = "2018"
+
+[dependencies]
+hashbrown = "0.3"
+nom = "4.2"
+parking_lot = "0.7"
+tokio = "0.1"
