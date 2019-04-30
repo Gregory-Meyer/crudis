@@ -153,7 +153,7 @@ mod tests {
                 BulkString("LLEN".to_string()),
                 BulkString("mylist".to_string()),
             ]),
-            "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n"
+            "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n",
         )
     }
 }
