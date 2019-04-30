@@ -22,10 +22,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::{
-    fmt::{self, Display, Formatter},
-    str::FromStr,
-};
+use std::fmt::{self, Display, Formatter};
 
 #[derive(Clone, Debug)]
 pub enum RespData {
@@ -33,7 +30,7 @@ pub enum RespData {
     Error(String),
     Integer(i64),
     BulkString(String),
-    Null,
+    Nil,
     Array(Vec<RespData>),
 }
 
@@ -46,7 +43,7 @@ impl Display for RespData {
             Error(e) => write!(f, "-{}\r\n", e),
             Integer(i) => write!(f, ":{}\r\n", i),
             BulkString(i) => write!(f, "${}\r\n{}\r\n", i.len(), i),
-            Null => write!(f, "$-1\r\n"),
+            Nil => write!(f, "$-1\r\n"),
             Array(d) => {
                 write!(f, "*{}\r\n", d.len())?;
 
@@ -108,7 +105,7 @@ mod tests {
 
     #[test]
     fn fmt_null() {
-        fmt_eq(&Null, "$-1\r\n");
+        fmt_eq(&Nil, "$-1\r\n");
     }
 
     #[test]
@@ -142,7 +139,7 @@ mod tests {
         fmt_eq(
             &Array(vec![
                 BulkString("foo".to_string()),
-                Null,
+                Nil,
                 BulkString("bar".to_string()),
             ]),
             "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n",
