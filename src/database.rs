@@ -29,6 +29,7 @@ use std::{cmp, collections::VecDeque, mem, sync::Arc};
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use lock_api::RwLockUpgradableReadGuard;
 use parking_lot::RwLock;
+use tokio::timer::Delay;
 
 pub enum Value {
     String(String),
@@ -38,19 +39,20 @@ pub enum Value {
 }
 
 impl Value {
-    fn new(value: Value) -> Arc<RwLock<Value>> {
-        Arc::new(RwLock::new(value))
+    fn new(value: Value) -> Arc<RwLock<(Value, Option<Delay>)>> {
+        Arc::new(RwLock::new((value, None)))
     }
 }
 
+#[derive(Clone)]
 pub struct Database {
-    map: RwLock<HashMap<String, Arc<RwLock<Value>>>>,
+    map: Arc<RwLock<HashMap<String, Arc<RwLock<(Value, Option<Delay>)>>>>>,
 }
 
 impl Database {
     pub fn new() -> Database {
         Database {
-            map: RwLock::new(HashMap::new()),
+            map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -75,7 +77,7 @@ impl Database {
 
         let bucket = bucket_ptr.read();
 
-        match &*bucket {
+        match &bucket.0 {
             Value::String(s) => RespData::BulkString(s.clone()),
             _ => Database::wrongtype(),
         }
@@ -103,7 +105,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        match &mut *bucket {
+        match &mut bucket.0 {
             Value::String(s) => {
                 mem::swap(s, &mut value);
 
@@ -137,7 +139,7 @@ impl Database {
                     if let Some(bucket_ptr) = maybe_bucket_ptr {
                         let bucket = bucket_ptr.read();
 
-                        if let Value::String(s) = &*bucket {
+                        if let Value::String(s) = &bucket.0 {
                             RespData::BulkString(s.clone())
                         } else {
                             RespData::Nil
@@ -172,9 +174,9 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        match &mut *bucket {
+        match &mut bucket.0 {
             Value::String(s) => *s = value,
-            _ => *bucket = Value::String(value),
+            _ => bucket.0 = Value::String(value),
         }
 
         Database::ok()
@@ -212,7 +214,7 @@ impl Database {
 
         let bucket = bucket_ptr.read();
 
-        if let Value::List(l) = &*bucket {
+        if let Value::List(l) = &bucket.0 {
             let offset = if index < 0 {
                 index + l.len() as isize
             } else {
@@ -242,7 +244,7 @@ impl Database {
 
         let bucket = bucket_ptr.read();
 
-        if let Value::List(l) = &*bucket {
+        if let Value::List(l) = &bucket.0 {
             RespData::Integer(l.len() as i64)
         } else {
             Database::wrongtype()
@@ -262,7 +264,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(l) = &mut *bucket {
+        if let Value::List(l) = &mut bucket.0 {
             if let Some(v) = l.pop_front() {
                 RespData::BulkString(v)
             } else {
@@ -298,7 +300,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(list) = &mut *bucket {
+        if let Value::List(list) = &mut bucket.0 {
             list.push_front(value);
 
             RespData::Integer(list.len() as i64)
@@ -320,7 +322,7 @@ impl Database {
 
         let bucket = bucket_ptr.read();
 
-        if let Value::List(l) = &*bucket {
+        if let Value::List(l) = &bucket.0 {
             let start_offset = if start < 0 {
                 start + l.len() as isize
             } else {
@@ -368,7 +370,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(l) = &mut *bucket {
+        if let Value::List(l) = &mut bucket.0 {
             if count > 0 {
                 let mut new_list = VecDeque::with_capacity(l.len());
                 let mut num_removed = 0;
@@ -424,7 +426,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(l) = &mut *bucket {
+        if let Value::List(l) = &mut bucket.0 {
             let offset = if index < 0 {
                 index + l.len() as isize
             } else {
@@ -454,7 +456,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(l) = &mut *bucket {
+        if let Value::List(l) = &mut bucket.0 {
             let start_offset = if start < 0 {
                 start + l.len() as isize
             } else {
@@ -500,7 +502,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(l) = &mut *bucket {
+        if let Value::List(l) = &mut bucket.0 {
             if let Some(v) = l.pop_back() {
                 RespData::BulkString(v)
             } else {
@@ -536,7 +538,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        if let Value::List(list) = &mut *bucket {
+        if let Value::List(list) = &mut bucket.0 {
             list.push_back(value);
 
             RespData::Integer(list.len() as i64)
@@ -607,7 +609,7 @@ impl Database {
 
         let mut bucket = bucket_ptr.write();
 
-        match &mut *bucket {
+        match &mut bucket.0 {
             Value::String(s) => {
                 if let Ok(i) = s.parse::<i64>().map(if_present) {
                     *s = format!("{}", i);
