@@ -86,6 +86,25 @@ named!(parse_resp<&str, RespData>,
     )
 );
 
+named!(parse_client_messsage<&str, Vec<Option<String>>>, do_parse!(
+    tag!("*") >>
+    len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+    elems: count!(alt!(
+        do_parse!(
+            tag!("$-1\r\n") >>
+            (None)
+        ) |
+        do_parse!(
+            tag!("$") >>
+            len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+            data: take!(len) >>
+            tag!("\r\n") >>
+            (Some(String::from(data)))
+        )
+    ), len) >>
+    (elems)
+));
+
 impl FromStr for RespData {
     type Err = ParseRespError;
 
@@ -339,5 +358,14 @@ mod tests {
                 BulkString("mylist".to_string()),
             ]),
         )
+    }
+
+    #[test]
+    fn parse_message() {
+        let msg = "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
+        let (rest, parsed) = parse_client_messsage(msg).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(parsed, vec![Some("LLEN".into()), Some("mylist".into())])
     }
 }
