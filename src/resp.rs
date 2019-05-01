@@ -23,7 +23,7 @@
 // SOFTWARE.
 
 use std::{
-    cmp::{Eq, PartialEq},
+    cmp::Eq,
     error::Error,
     fmt::{self, Display, Formatter},
     str::{self, FromStr},
@@ -31,7 +31,7 @@ use std::{
 
 use nom::{alt, call, count, do_parse, map_res, named, switch, tag, take, take_until_and_consume};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
     SimpleString(String),
     Error(String),
@@ -39,57 +39,6 @@ pub enum RespData {
     BulkString(String),
     Nil,
     Array(Vec<RespData>),
-}
-
-impl PartialEq for RespData {
-    fn eq(&self, other: &RespData) -> bool {
-        use RespData::*;
-
-        match self {
-            SimpleString(lhs) => {
-                if let SimpleString(rhs) = other {
-                    lhs == rhs
-                } else {
-                    false
-                }
-            }
-            Error(lhs) => {
-                if let Error(rhs) = other {
-                    lhs == rhs
-                } else {
-                    false
-                }
-            }
-            Integer(lhs) => {
-                if let Integer(rhs) = other {
-                    lhs == rhs
-                } else {
-                    false
-                }
-            }
-            BulkString(lhs) => {
-                if let BulkString(rhs) = other {
-                    lhs == rhs
-                } else {
-                    false
-                }
-            }
-            Nil => {
-                if let Nil = other {
-                    true
-                } else {
-                    false
-                }
-            }
-            Array(lhs) => {
-                if let Array(rhs) = other {
-                    lhs == rhs
-                } else {
-                    false
-                }
-            }
-        }
-    }
 }
 
 impl Eq for RespData {}
@@ -146,22 +95,38 @@ impl FromStr for RespData {
                 if rem.is_empty() {
                     Ok(res)
                 } else {
-                    Err(ParseRespError())
+                    Err(ParseRespError::TrailingData)
                 }
             }
-            Err(_) => Err(ParseRespError()),
+            Err(e) => {
+                if e.is_incomplete() {
+                    Err(ParseRespError::Incomplete)
+                } else {
+                    Err(ParseRespError::Other)
+                }
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub struct ParseRespError();
+pub enum ParseRespError {
+    Incomplete,
+    TrailingData,
+    Other,
+}
 
 impl Error for ParseRespError {}
 
 impl Display for ParseRespError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "unexpected character in string")
+        use ParseRespError::*;
+
+        match self {
+            Incomplete => write!(f, "incomplete parse"),
+            TrailingData => write!(f, "trailing data"),
+            Other => write!(f, "unknown"),
+        }
     }
 }
 
