@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn parse_message() {
-        let msg = "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
+        let msg = b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
         let (rest, parsed) = parse_client_messsage(msg).unwrap();
 
         assert!(rest.is_empty());
