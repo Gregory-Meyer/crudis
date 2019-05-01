@@ -29,7 +29,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use nom::{alt, call, count, do_parse, map_res, named, switch, tag, take, take_until_and_consume};
+use nom::{alt, count, do_parse, map_res, named, tag, take, take_until_and_consume};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
@@ -43,48 +43,55 @@ pub enum RespData {
 
 impl Eq for RespData {}
 
-named!(parse_simple_string<&str, RespData>, do_parse!(
-    data: take_until_and_consume!("\r\n") >>
-    (RespData::SimpleString(data.into()))
-));
+mod parse {
+    use super::*;
+    use nom::{
+        alt, call, count, do_parse, map_res, named, switch, tag, take, take_until_and_consume,
+    };
 
-named!(parse_error<&str, RespData>, do_parse!(
-    data: take_until_and_consume!("\r\n") >>
-    (RespData::Error(data.into()))
-));
+    named!(simple_string<&str, RespData>, do_parse!(
+        data: take_until_and_consume!("\r\n") >>
+        (RespData::SimpleString(data.into()))
+    ));
 
-named!(parse_integer<&str, RespData>, do_parse!(
-    value: map_res!(take_until_and_consume!("\r\n"), str::parse) >>
-    (RespData::Integer(value))
-));
+    named!(error<&str, RespData>, do_parse!(
+        data: take_until_and_consume!("\r\n") >>
+        (RespData::Error(data.into()))
+    ));
 
-named!(parse_bulk_string<&str, RespData>, do_parse!(
-    len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
-    data: take!(len) >>
-    tag!("\r\n") >>
-    (RespData::BulkString(data.into()))
-));
+    named!(integer<&str, RespData>, do_parse!(
+        value: map_res!(take_until_and_consume!("\r\n"), str::parse) >>
+        (RespData::Integer(value))
+    ));
 
-named!(parse_nil<&str, RespData>, do_parse!(
-    tag!("-1\r\n") >>
-    (RespData::Nil)
-));
+    named!(bulk_string<&str, RespData>, do_parse!(
+        len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+        data: take!(len) >>
+        tag!("\r\n") >>
+        (RespData::BulkString(data.into()))
+    ));
 
-named!(parse_array<&str, RespData>, do_parse!(
-    len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
-    results: count!(parse_resp, len) >>
-    (RespData::Array(results))
-));
+    named!(nil<&str, RespData>, do_parse!(
+        tag!("-1\r\n") >>
+        (RespData::Nil)
+    ));
 
-named!(parse_resp<&str, RespData>,
-    switch!(take!(1),
-        "+" => call!(parse_simple_string) |
-        "-" => call!(parse_error) |
-        ":" => call!(parse_integer) |
-        "$" => alt!(call!(parse_nil) | call!(parse_bulk_string)) |
-        "*" => call!(parse_array)
-    )
-);
+    named!(array<&str, RespData>, do_parse!(
+        len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+        results: count!(resp, len) >>
+        (RespData::Array(results))
+    ));
+
+    named!(pub resp<&str, RespData>,
+        switch!(take!(1),
+            "+" => call!(simple_string) |
+            "-" => call!(error) |
+            ":" => call!(integer) |
+            "$" => alt!(call!(nil) | call!(bulk_string)) |
+            "*" => call!(array)
+        )
+    );
+} // mod parse
 
 named!(parse_client_messsage<&str, Vec<Option<String>>>, do_parse!(
     tag!("*") >>
@@ -109,7 +116,7 @@ impl FromStr for RespData {
     type Err = ParseRespError;
 
     fn from_str(s: &str) -> Result<RespData, ParseRespError> {
-        match parse_resp(s) {
+        match parse::resp(s) {
             Ok((rem, res)) => {
                 if rem.is_empty() {
                     Ok(res)
