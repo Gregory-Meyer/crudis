@@ -93,9 +93,15 @@ mod parse {
     );
 } // mod parse
 
-named!(parse_client_messsage<&str, Vec<Option<String>>>, do_parse!(
+named!(parse_client_messsage<&[u8], Vec<Option<String>>>, do_parse!(
     tag!("*") >>
-    len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+    len: map_res!(
+        map_res!(
+            take_until_and_consume!("\r\n"),
+            str::from_utf8
+        ),
+        str::parse::<usize>
+    ) >>
     elems: count!(alt!(
         do_parse!(
             tag!("$-1\r\n") >>
@@ -103,8 +109,14 @@ named!(parse_client_messsage<&str, Vec<Option<String>>>, do_parse!(
         ) |
         do_parse!(
             tag!("$") >>
-            len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
-            data: take!(len) >>
+            len: map_res!(
+                map_res!(
+                    take_until_and_consume!("\r\n"),
+                    str::from_utf8
+                ),
+                str::parse::<usize>
+            ) >>
+            data: map_res!(take!(len), str::from_utf8) >>
             tag!("\r\n") >>
             (Some(String::from(data)))
         )
