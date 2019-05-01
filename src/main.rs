@@ -22,9 +22,36 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+mod connection;
 mod database;
+mod instance;
 mod resp;
 
+use database::Database;
+
+use std::{env, iter, net::SocketAddr};
+
+use tokio::{
+    net::{TcpListener, TcpStream},
+    prelude::*,
+};
+
+fn handle(dbs: &[Database], socket: TcpStream) {}
+
 fn main() {
-    println!("Hello, world!");
+    let addr = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:6379".to_string())
+        .parse::<SocketAddr>()
+        .expect("couldn't parse string as an address");
+
+    let databases: Vec<_> = iter::repeat_with(|| Database::new()).take(16).collect();
+    let socket = TcpListener::bind(&addr).expect("couldn't bind TCP listener");
+    let incoming = socket.incoming();
+
+    let server = incoming
+        .map_err(|e| eprintln!("couldn't accept TCP connection: {}", e))
+        .for_each(|socket| Ok(()));
+
+    tokio::run(server);
 }
