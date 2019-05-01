@@ -341,7 +341,8 @@ impl Database {
             } else {
                 let numel = stop_clamped + 1 - start_clamped;
 
-                let elems = l.iter()
+                let elems = l
+                    .iter()
                     .skip(start_clamped)
                     .take(numel)
                     .cloned()
@@ -544,6 +545,22 @@ impl Database {
         }
     }
 
+    pub fn del(&self, keys: &[&str]) -> RespData {
+        let mut map = self.map.write();
+
+        RespData::Integer(
+            keys.iter()
+                .map(|k| map.remove(*k).is_some())
+                .fold(0, |p, n| p + n as i64),
+        )
+    }
+
+    pub fn exists(&self, key: &str) -> RespData {
+        let map = self.map.read();
+
+        RespData::Integer(map.contains_key(key) as i64)
+    }
+
     fn ok() -> RespData {
         RespData::SimpleString("OK".to_string())
     }
@@ -555,15 +572,11 @@ impl Database {
     }
 
     fn out_of_range() -> RespData {
-        RespData::Error(
-            "ERR index out of range".to_string(),
-        )
+        RespData::Error("ERR index out of range".to_string())
     }
 
     fn no_such_key() -> RespData {
-        RespData::Error(
-            "ERR no such key".to_string(),
-        )
+        RespData::Error("ERR no such key".to_string())
     }
 
     fn rmw_integer<F: FnOnce(i64) -> i64, G: FnOnce() -> i64>(
