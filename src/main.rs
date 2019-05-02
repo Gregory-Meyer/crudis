@@ -30,7 +30,8 @@ use resp::RespData;
 
 use std::{
     env,
-    fmt::Write as FmtWrite,
+    fmt::{self, Write as FmtWrite, Formatter},
+    fmt::Display,
     io::Write,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
 };
@@ -131,6 +132,20 @@ lazy_static! {
     };
 }
 
+struct Command<'a>(&'a [String]);
+
+impl<'a> Display for Command<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "`{}`, with args beginning with: ", self.0[0])?;
+
+        for arg in self.0[1..].iter() {
+            write!(f, "`{}`, ", arg)?;
+        }
+
+        Ok(())
+    }
+}
+
 fn make_response(db: &Database, msg: &[String]) -> RespData {
     assert!(!msg.is_empty());
 
@@ -145,7 +160,7 @@ fn make_response(db: &Database, msg: &[String]) -> RespData {
             f(db, &msg[1..])
         }
     } else {
-        let msg = format!("ERR unknown command `{}`", msg[0]);
+        let msg = format!("ERR unknown command {}", Command(msg));
 
         RespData::Error(msg)
     }
