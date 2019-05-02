@@ -50,6 +50,107 @@ use lazy_static::lazy_static;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+fn main() {
+    let addr = env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| {
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
+                6379,
+                0,
+                0,
+            ))
+        });
+
+    let listener = TcpListener::bind(&addr).expect("couldn't bind TCP listener");
+    let db = Database::new();
+
+    let server = listener
+        .incoming()
+        .map_err(|e| eprintln!("couldn't accept a TCP connection: {}", e))
+        .for_each(move |sock| {
+            let (writer, reader) = Framed::new(sock, RespCodec::new()).split();
+
+            let db = db.clone();
+            tokio::spawn(
+                reader
+                    .map(move |msg| make_response(&db, &msg))
+                    .forward(writer)
+                    .map(|_| ())
+                    .map_err(|e| eprintln!("couldn't write response: {}", e)),
+            )
+        });
+
+    tokio::run(server);
+}
+
+fn make_response(db: &Database, msg: &[String]) -> RespData {
+    assert!(!msg.is_empty());
+
+    let command = msg[0].to_lowercase();
+
+    if let Some((arity, f)) = COMMANDS.get(command.as_str()) {
+        if (*arity != -1) && (msg.len() != (*arity as usize) + 1) {
+            let msg = format!("ERR wrong number of arguments for '{}' command", command);
+
+            RespData::Error(msg)
+        } else {
+            f(db, &msg[1..])
+        }
+    } else {
+        let msg = format!("ERR unknown command {}", Command(msg));
+
+        RespData::Error(msg)
+    }
+}
+
+struct Command<'a>(&'a [String]);
+
+impl<'a> Display for Command<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "`{}`, with args beginning with: ", self.0[0])?;
+
+        for arg in self.0[1..].iter() {
+            write!(f, "`{}`, ", arg)?;
+        }
+
+        Ok(())
+    }
+}
+
+type Handler = fn(&Database, &[String]) -> RespData;
+
+lazy_static! {
+    static ref COMMANDS: HashMap<&'static str, (isize, Handler)> = {
+        let mut commands = HashMap::new();
+        commands.insert("decr", (1, handle_decr as Handler));
+        commands.insert("decrby", (2, handle_decrby as Handler));
+        commands.insert("get", (1, handle_get as Handler));
+        commands.insert("getset", (2, handle_getset as Handler));
+        commands.insert("incr", (1, handle_incr as Handler));
+        commands.insert("incrby", (2, handle_incrby as Handler));
+        commands.insert("mget", (-1, handle_mget as Handler));
+        commands.insert("set", (2, handle_set as Handler));
+        commands.insert("setnx", (2, handle_setnx as Handler));
+        commands.insert("lindex", (2, handle_lindex as Handler));
+        commands.insert("llen", (1, handle_llen as Handler));
+        commands.insert("lpop", (1, handle_lpop as Handler));
+        commands.insert("lpush", (2, handle_lpush as Handler));
+        commands.insert("lrange", (3, handle_lrange as Handler));
+        commands.insert("lrem", (3, handle_lrem as Handler));
+        commands.insert("lset", (3, handle_lset as Handler));
+        commands.insert("ltrim", (3, handle_ltrim as Handler));
+        commands.insert("rpop", (1, handle_rpop as Handler));
+        commands.insert("rpush", (2, handle_rpush as Handler));
+        commands.insert("del", (-1, handle_del as Handler));
+        commands.insert("exists", (1, handle_exists as Handler));
+        commands.insert("ping", (0, handle_ping as Handler));
+
+        commands
+    };
+}
+
 struct RespCodec {
     start_idx: usize,
 }
@@ -57,6 +158,21 @@ struct RespCodec {
 impl RespCodec {
     fn new() -> RespCodec {
         RespCodec { start_idx: 0 }
+    }
+}
+
+impl Encoder for RespCodec {
+    type Item = RespData;
+    type Error = io::Error;
+
+    fn encode(&mut self, data: RespData, dest: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut length_finder = LengthFinder(0);
+        write!(&mut length_finder, "{}", data).unwrap();
+        dest.reserve(length_finder.0);
+
+        write!(dest, "{}", data).unwrap();
+
+        Ok(())
     }
 }
 
@@ -104,98 +220,6 @@ impl Write for LengthFinder {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-impl Encoder for RespCodec {
-    type Item = RespData;
-    type Error = io::Error;
-
-    fn encode(&mut self, data: RespData, dest: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut length_finder = LengthFinder(0);
-        write!(&mut length_finder, "{}", data).unwrap();
-        dest.reserve(length_finder.0);
-
-        write!(dest, "{}", data).unwrap();
-
-        Ok(())
-    }
-}
-
-type Handler = fn(&Database, &[String]) -> RespData;
-
-lazy_static! {
-    static ref COMMANDS: HashMap<&'static str, (isize, Handler)> = {
-        let mut commands = HashMap::new();
-        commands.insert("decr", (1, handle_decr as Handler));
-        commands.insert("decrby", (2, handle_decrby as Handler));
-        commands.insert("get", (1, handle_get as Handler));
-        commands.insert("getset", (2, handle_getset as Handler));
-        commands.insert("incr", (1, handle_incr as Handler));
-        commands.insert("incrby", (2, handle_incrby as Handler));
-        commands.insert("mget", (-1, handle_mget as Handler));
-        commands.insert("set", (2, handle_set as Handler));
-        commands.insert("setnx", (2, handle_setnx as Handler));
-        commands.insert("lindex", (2, handle_lindex as Handler));
-        commands.insert("llen", (1, handle_llen as Handler));
-        commands.insert("lpop", (1, handle_lpop as Handler));
-        commands.insert("lpush", (2, handle_lpush as Handler));
-        commands.insert("lrange", (3, handle_lrange as Handler));
-        commands.insert("lrem", (3, handle_lrem as Handler));
-        commands.insert("lset", (3, handle_lset as Handler));
-        commands.insert("ltrim", (3, handle_ltrim as Handler));
-        commands.insert("rpop", (1, handle_rpop as Handler));
-        commands.insert("rpush", (2, handle_rpush as Handler));
-        commands.insert("del", (-1, handle_del as Handler));
-        commands.insert("exists", (1, handle_exists as Handler));
-        commands.insert("ping", (0, handle_ping as Handler));
-
-        commands
-    };
-}
-
-struct Command<'a>(&'a [String]);
-
-impl<'a> Display for Command<'a> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "`{}`, with args beginning with: ", self.0[0])?;
-
-        for arg in self.0[1..].iter() {
-            write!(f, "`{}`, ", arg)?;
-        }
-
-        Ok(())
-    }
-}
-
-fn make_response(db: &Database, msg: &[String]) -> RespData {
-    assert!(!msg.is_empty());
-
-    let command = msg[0].to_lowercase();
-
-    if let Some((arity, f)) = COMMANDS.get(command.as_str()) {
-        if (*arity != -1) && (msg.len() != (*arity as usize) + 1) {
-            let msg = format!("ERR wrong number of arguments for '{}' command", command);
-
-            RespData::Error(msg)
-        } else {
-            let mut args = String::with_capacity(
-                msg.iter().map(String::len).fold(0, |x, y| x + y) + msg.len() - 1,
-            );
-
-            write!(args, "{}", msg[0]).unwrap();
-
-            for elem in msg[1..].iter() {
-                write!(args, " {}", elem).unwrap();
-            }
-
-            println!("{}", args);
-            f(db, &msg[1..])
-        }
-    } else {
-        let msg = format!("ERR unknown command {}", Command(msg));
-
-        RespData::Error(msg)
     }
 }
 
@@ -293,41 +317,4 @@ fn handle_exists(db: &Database, args: &[String]) -> RespData {
 
 fn handle_ping(_: &Database, _: &[String]) -> RespData {
     RespData::SimpleString("PONG".to_string())
-}
-
-fn main() {
-    let addr = env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| {
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
-                6379,
-                0,
-                0,
-            ))
-        });
-
-    let listener = TcpListener::bind(&addr).expect("couldn't bind TCP listener");
-    let db = Database::new();
-
-    let server = listener
-        .incoming()
-        .map_err(|e| eprintln!("couldn't accept a TCP connection: {}", e))
-        .for_each(move |sock| {
-            println!("connected to {}", sock.peer_addr().unwrap());
-
-            let (writer, reader) = Framed::new(sock, RespCodec::new()).split();
-
-            let db = db.clone();
-            tokio::spawn(
-                reader
-                    .map(move |msg| make_response(&db, &msg))
-                    .forward(writer)
-                    .map(|_| ())
-                    .map_err(|e| eprintln!("couldn't write response: {}", e)),
-            )
-        });
-
-    tokio::run(server);
 }
