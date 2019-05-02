@@ -122,10 +122,29 @@ impl Encoder for RespCodec {
 type Handler = fn(&Database, &[String]) -> RespData;
 
 lazy_static! {
-    static ref COMMANDS: HashMap<&'static str, (usize, Handler)> = {
+    static ref COMMANDS: HashMap<&'static str, (isize, Handler)> = {
         let mut commands = HashMap::new();
+        commands.insert("decr", (1, handle_decr as Handler));
+        commands.insert("decrby", (2, handle_decrby as Handler));
         commands.insert("get", (1, handle_get as Handler));
+        commands.insert("getset", (2, handle_getset as Handler));
+        commands.insert("incr", (1, handle_incr as Handler));
+        commands.insert("incrby", (2, handle_incrby as Handler));
+        commands.insert("mget", (-1, handle_mget as Handler));
         commands.insert("set", (2, handle_set as Handler));
+        commands.insert("setnx", (2, handle_setnx as Handler));
+        commands.insert("lindex", (2, handle_lindex as Handler));
+        commands.insert("llen", (1, handle_llen as Handler));
+        commands.insert("lpop", (1, handle_lpop as Handler));
+        commands.insert("lpush", (2, handle_lpush as Handler));
+        commands.insert("lrange", (3, handle_lrange as Handler));
+        commands.insert("lrem", (3, handle_lrem as Handler));
+        commands.insert("lset", (3, handle_lset as Handler));
+        commands.insert("ltrim", (3, handle_ltrim as Handler));
+        commands.insert("rpop", (1, handle_rpop as Handler));
+        commands.insert("rpush", (2, handle_rpush as Handler));
+        commands.insert("del", (-1, handle_del as Handler));
+        commands.insert("exists", (1, handle_exists as Handler));
         commands.insert("ping", (0, handle_ping as Handler));
 
         commands
@@ -152,7 +171,7 @@ fn make_response(db: &Database, msg: &[String]) -> RespData {
     let command = msg[0].to_lowercase();
 
     if let Some((arity, f)) = COMMANDS.get(command.as_str()) {
-        if msg.len() != arity + 1 {
+        if (*arity != -1) && (msg.len() != (*arity as usize) + 1) {
             let msg = format!("ERR wrong number of arguments for '{}' command", command);
 
             RespData::Error(msg)
@@ -166,12 +185,88 @@ fn make_response(db: &Database, msg: &[String]) -> RespData {
     }
 }
 
+fn handle_decr(db: &Database, args: &[String]) -> RespData {
+    db.decr(args[0].clone())
+}
+
+fn handle_decrby(db: &Database, args: &[String]) -> RespData {
+    db.decrby(args[0].clone(), args[1].parse().unwrap())
+}
+
 fn handle_get(db: &Database, args: &[String]) -> RespData {
     db.get(args[0].as_str())
 }
 
+fn handle_getset(db: &Database, args: &[String]) -> RespData {
+    db.getset(args[0].clone(), args[1].clone())
+}
+
+fn handle_incr(db: &Database, args: &[String]) -> RespData {
+    db.incr(args[0].clone())
+}
+
+fn handle_incrby(db: &Database, args: &[String]) -> RespData {
+    db.incrby(args[0].clone(), args[1].parse().unwrap())
+}
+
+fn handle_mget(db: &Database, args: &[String]) -> RespData {
+    db.mget(args)
+}
+
 fn handle_set(db: &Database, args: &[String]) -> RespData {
     db.set(args[0].clone(), args[1].clone())
+}
+
+fn handle_setnx(db: &Database, args: &[String]) -> RespData {
+    db.setnx(args[0].clone(), args[1].clone())
+}
+
+fn handle_lindex(db: &Database, args: &[String]) -> RespData {
+    db.lindex(args[0].as_str(), args[1].parse().unwrap())
+}
+
+fn handle_llen(db: &Database, args: &[String]) -> RespData {
+    db.llen(args[0].as_str())
+}
+
+fn handle_lpop(db: &Database, args: &[String]) -> RespData {
+    db.lpop(args[0].as_str())
+}
+
+fn handle_lpush(db: &Database, args: &[String]) -> RespData {
+    db.lpush(args[0].clone(), args[1].clone())
+}
+
+fn handle_lrange(db: &Database, args: &[String]) -> RespData {
+    db.lrange(args[0].as_str(), args[1].parse().unwrap(), args[2].parse().unwrap())
+}
+
+fn handle_lrem(db: &Database, args: &[String]) -> RespData {
+    db.lrem(args[0].as_str(), args[1].parse().unwrap(), args[2].as_str())
+}
+
+fn handle_lset(db: &Database, args: &[String]) -> RespData {
+    db.lset(args[0].as_str(), args[1].parse().unwrap(), args[2].clone())
+}
+
+fn handle_ltrim(db: &Database, args: &[String]) -> RespData {
+    db.ltrim(args[0].as_str(), args[1].parse().unwrap(), args[2].parse().unwrap())
+}
+
+fn handle_rpop(db: &Database, args: &[String]) -> RespData {
+    db.rpop(args[0].as_str())
+}
+
+fn handle_rpush(db: &Database, args: &[String]) -> RespData {
+    db.rpush(args[0].clone(), args[1].clone())
+}
+
+fn handle_del(db: &Database, args: &[String]) -> RespData {
+    db.del(args)
+}
+
+fn handle_exists(db: &Database, args: &[String]) -> RespData {
+    db.exists(args[0].as_str())
 }
 
 fn handle_ping(_: &Database, _: &[String]) -> RespData {

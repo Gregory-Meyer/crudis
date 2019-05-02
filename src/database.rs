@@ -125,12 +125,12 @@ impl Database {
         self.rmw_integer(key, |x| x + increment, || increment)
     }
 
-    pub fn mget(&self, keys: &[&str]) -> RespData {
+    pub fn mget<S: AsRef<str>>(&self, keys: &[S]) -> RespData {
         let maybe_bucket_ptrs: Vec<_> = {
             let map = self.map.read();
 
             keys.iter()
-                .map(|k| map.get(*k).map(|v| v.clone()))
+                .map(|k| map.get(k.as_ref()).map(|v| v.clone()))
                 .collect()
         };
 
@@ -549,12 +549,12 @@ impl Database {
         }
     }
 
-    pub fn del(&self, keys: &[&str]) -> RespData {
+    pub fn del<S: AsRef<str>>(&self, keys: &[S]) -> RespData {
         let mut map = self.map.write();
 
         RespData::Integer(
             keys.iter()
-                .map(|k| map.remove(*k).is_some())
+                .map(|k| map.remove(k.as_ref()).is_some())
                 .fold(0, |p, n| p + n as i64),
         )
     }
