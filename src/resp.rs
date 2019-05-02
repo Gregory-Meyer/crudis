@@ -29,7 +29,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use nom::{alt, count, do_parse, map_res, named, tag, take, take_until_and_consume};
+use nom::{count, do_parse, map_res, named, tag, take, take_until_and_consume};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
@@ -93,7 +93,7 @@ mod parse {
     );
 } // mod parse
 
-named!(parse_client_messsage<&[u8], Vec<Option<String>>>, do_parse!(
+named!(pub parse_client_message<&[u8], Vec<String>>, do_parse!(
     tag!("*") >>
     len: map_res!(
         map_res!(
@@ -102,24 +102,18 @@ named!(parse_client_messsage<&[u8], Vec<Option<String>>>, do_parse!(
         ),
         str::parse::<usize>
     ) >>
-    elems: count!(alt!(
-        do_parse!(
-            tag!("$-1\r\n") >>
-            (None)
-        ) |
-        do_parse!(
-            tag!("$") >>
-            len: map_res!(
-                map_res!(
-                    take_until_and_consume!("\r\n"),
-                    str::from_utf8
-                ),
-                str::parse::<usize>
-            ) >>
-            data: map_res!(take!(len), str::from_utf8) >>
-            tag!("\r\n") >>
-            (Some(String::from(data)))
-        )
+    elems: count!(do_parse!(
+        tag!("$") >>
+        len: map_res!(
+            map_res!(
+                take_until_and_consume!("\r\n"),
+                str::from_utf8
+            ),
+            str::parse::<usize>
+        ) >>
+        data: map_res!(take!(len), str::from_utf8) >>
+        tag!("\r\n") >>
+        (String::from(data))
     ), len) >>
     (elems)
 ));
@@ -382,9 +376,9 @@ mod tests {
     #[test]
     fn parse_message() {
         let msg = b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
-        let (rest, parsed) = parse_client_messsage(msg).unwrap();
+        let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec![Some("LLEN".into()), Some("mylist".into())])
+        assert_eq!(parsed, vec!["LLEN".into(), "mylist".into()])
     }
 }
