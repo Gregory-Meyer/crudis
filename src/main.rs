@@ -26,31 +26,19 @@ mod database;
 mod resp;
 
 use database::Database;
-use resp::RespData;
 
 use std::{
     env,
     fmt::Display,
-    fmt::{self, Formatter, Write as FmtWrite},
-    io::Write,
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    fmt::{self, Formatter},
+    io::{ErrorKind, Read, Write},
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream},
+    process, thread,
 };
 
-use bytes::BytesMut;
-use hashbrown::HashMap;
-use tokio::{
-    codec::{Decoder, Encoder, Framed},
-    io::{self, ErrorKind},
-    net::tcp::TcpListener,
-    prelude::*,
-};
+use nom::Context;
 
-use lazy_static::lazy_static;
-
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-fn main() {
+fn start() -> i32 {
     let addr = env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
@@ -63,45 +51,143 @@ fn main() {
             ))
         });
 
-    let listener = TcpListener::bind(&addr).expect("couldn't bind TCP listener");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("crudis: couldn't bind to {}: {}", addr, e);
+
+            return 1;
+        }
+    };
+
     let db = Database::new();
 
-    let server = listener
-        .incoming()
-        .map_err(|e| eprintln!("couldn't accept a TCP connection: {}", e))
-        .for_each(move |sock| {
-            let (writer, reader) = Framed::new(sock, RespCodec::new()).split();
+    loop {
+        let (socket, client_addr) = match listener.accept() {
+            Ok((s, a)) => (s, a),
+            Err(e) => {
+                eprintln!("crudis: couldn't accept a connection: {}", e);
 
-            let db = db.clone();
-            tokio::spawn(
-                reader
-                    .map(move |msg| make_response(&db, &msg))
-                    .forward(writer)
-                    .map(|_| ())
-                    .map_err(|e| eprintln!("couldn't write response: {}", e)),
-            )
+                continue;
+            }
+        };
+
+        println!("crudis: accepted a connection from {}", client_addr);
+
+        if let Err(e) = socket.set_nodelay(true) {
+            eprintln!("crudis: couldn't disable Nagle's algorithm: {}", e);
+        }
+
+        if let Err(e) = socket.set_write_timeout(None) {
+            eprintln!("crudis: couldn't disable socket write timeout: {}", e);
+        }
+
+        if let Err(e) = socket.set_read_timeout(None) {
+            eprintln!("crudis: couldn't disable socket read timeout: {}", e);
+        }
+
+        let db = db.clone();
+        thread::spawn(move || {
+            client_loop(db, socket);
+
+            println!("crudis: closed connection with {}", client_addr);
         });
+    }
 
-    tokio::run(server);
+    0
 }
 
-fn make_response(db: &Database, msg: &[String]) -> RespData {
+fn client_loop(db: Database, mut socket: TcpStream) {
+    let mut start_idx = 0;
+    let mut buf = Vec::with_capacity(4096);
+
+    loop {
+        if let Some(_) = buf[start_idx..].iter().position(|b| *b == b'\n') {
+            let (maybe_msg, new_start_idx) = parse_buffer(&mut buf);
+            start_idx = new_start_idx;
+
+            if let Some(msg) = maybe_msg {
+                let response = make_response(&db, msg);
+
+                if let Err(e) = socket.write_all(&response) {
+                    if e.kind() == ErrorKind::ConnectionReset {
+                        return;
+                    }
+
+                    eprintln!("crudis: couldn't write to socket: {:?}", e);
+                }
+            }
+        } else {
+            start_idx = buf.len();
+            let new_data_start = buf.len();
+            buf.extend_from_slice(&[0; 4096]);
+
+            match socket.read(&mut buf[start_idx..]) {
+                Ok(i) => {
+                    if i == 0 {
+                        return;
+                    } else {
+                        buf.truncate(new_data_start + i)
+                    }
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::ConnectionReset => return,
+                    _ => eprintln!("crudis: failed to read from socket: {:?}", e),
+                },
+            }
+        }
+    }
+}
+
+fn parse_buffer(buf: &mut Vec<u8>) -> (Option<Vec<String>>, usize) {
+    match resp::parse_client_message(buf.as_ref()) {
+        Ok((rest, msg)) => {
+            let to_trim = buf.len() - rest.len();
+            buf.drain(..to_trim);
+
+            (Some(msg), 0)
+        }
+        Err(e) => match e {
+            nom::Err::Incomplete(_) => (None, buf.len()),
+            nom::Err::Error(c) | nom::Err::Failure(c) => match c {
+                Context::Code(i, _) => {
+                    buf.drain(..buf.len() - i.len());
+
+                    (None, 0)
+                }
+            },
+        },
+    }
+}
+
+fn main() {
+    let retc = start();
+
+    if retc != 0 {
+        process::exit(retc);
+    }
+}
+
+fn make_response(db: &Database, msg: Vec<String>) -> Vec<u8> {
     assert!(!msg.is_empty());
 
     let command = msg[0].to_lowercase();
 
-    if let Some((arity, f)) = COMMANDS.get(command.as_str()) {
-        if (*arity != -1) && (msg.len() != (*arity as usize) + 1) {
-            let msg = format!("ERR wrong number of arguments for '{}' command", command);
-
-            RespData::Error(msg)
+    if let Some((arity, f)) = get_command(command.as_str()) {
+        if (arity != -1) && (msg.len() != (arity as usize) + 1) {
+            format!(
+                "-ERR wrong number of arguments for '{}' command\r\n",
+                command
+            )
+            .into_bytes()
         } else {
-            f(db, &msg[1..])
+            let mut response = Vec::new();
+            f(db, msg, &mut response);
+
+            response
         }
     } else {
-        let msg = format!("ERR unknown command {}", Command(msg));
-
-        RespData::Error(msg)
+        format!("-ERR unknown command {}\r\n", Command(&msg)).into_bytes()
     }
 }
 
@@ -119,202 +205,240 @@ impl<'a> Display for Command<'a> {
     }
 }
 
-type Handler = fn(&Database, &[String]) -> RespData;
+type Handler = fn(&Database, Vec<String>, &mut Vec<u8>);
 
-lazy_static! {
-    static ref COMMANDS: HashMap<&'static str, (isize, Handler)> = {
-        let mut commands = HashMap::new();
-        commands.insert("decr", (1, handle_decr as Handler));
-        commands.insert("decrby", (2, handle_decrby as Handler));
-        commands.insert("get", (1, handle_get as Handler));
-        commands.insert("getset", (2, handle_getset as Handler));
-        commands.insert("incr", (1, handle_incr as Handler));
-        commands.insert("incrby", (2, handle_incrby as Handler));
-        commands.insert("mget", (-1, handle_mget as Handler));
-        commands.insert("set", (2, handle_set as Handler));
-        commands.insert("setnx", (2, handle_setnx as Handler));
-        commands.insert("lindex", (2, handle_lindex as Handler));
-        commands.insert("llen", (1, handle_llen as Handler));
-        commands.insert("lpop", (1, handle_lpop as Handler));
-        commands.insert("lpush", (2, handle_lpush as Handler));
-        commands.insert("lrange", (3, handle_lrange as Handler));
-        commands.insert("lrem", (3, handle_lrem as Handler));
-        commands.insert("lset", (3, handle_lset as Handler));
-        commands.insert("ltrim", (3, handle_ltrim as Handler));
-        commands.insert("rpop", (1, handle_rpop as Handler));
-        commands.insert("rpush", (2, handle_rpush as Handler));
-        commands.insert("del", (-1, handle_del as Handler));
-        commands.insert("exists", (1, handle_exists as Handler));
-        commands.insert("ping", (0, handle_ping as Handler));
-
-        commands
-    };
-}
-
-struct RespCodec {
-    start_idx: usize,
-}
-
-impl RespCodec {
-    fn new() -> RespCodec {
-        RespCodec { start_idx: 0 }
+fn get_command(command: &str) -> Option<(isize, Handler)> {
+    match command {
+        "decr" => Some((1, handle_decr)),
+        "decrby" => Some((2, handle_decrby)),
+        "get" => Some((1, handle_get)),
+        "getset" => Some((2, handle_getset)),
+        "incr" => Some((1, handle_incr)),
+        "incrby" => Some((2, handle_incrby)),
+        "mget" => Some((-1, handle_mget)),
+        "set" => Some((2, handle_set)),
+        "setnx" => Some((2, handle_setnx)),
+        "lindex" => Some((2, handle_lindex)),
+        "llen" => Some((1, handle_llen)),
+        "lpop" => Some((1, handle_lpop)),
+        "lpush" => Some((2, handle_lpush)),
+        "lrange" => Some((3, handle_lrange)),
+        "lrem" => Some((3, handle_lrem)),
+        "lset" => Some((3, handle_lset)),
+        "ltrim" => Some((3, handle_ltrim)),
+        "rpop" => Some((1, handle_rpop)),
+        "rpush" => Some((2, handle_rpush)),
+        "del" => Some((-1, handle_del)),
+        "exists" => Some((1, handle_exists)),
+        "ping" => Some((0, handle_ping)),
+        _ => None,
     }
 }
 
-impl Encoder for RespCodec {
-    type Item = RespData;
-    type Error = io::Error;
+fn handle_decr(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let key = args.into_iter().nth(1).unwrap();
 
-    fn encode(&mut self, data: RespData, dest: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut length_finder = LengthFinder(0);
-        write!(&mut length_finder, "{}", data).unwrap();
-        dest.reserve(length_finder.0);
-
-        write!(dest, "{}", data).unwrap();
-
-        Ok(())
-    }
+    db.decr(key, buf).unwrap();
 }
 
-impl Decoder for RespCodec {
-    type Item = Vec<String>;
-    type Error = io::Error;
+fn handle_decrby(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some(_) = src[self.start_idx..].iter().position(|b| *b == b'\n') {
-            match resp::parse_client_message(src.as_ref()) {
-                Ok((rest, msg)) => {
-                    let to_trim = src.len() - rest.len();
-                    src.advance(to_trim);
-                    self.start_idx = 0;
+    let decrement = match iter.next().unwrap().parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
 
-                    Ok(Some(msg))
-                }
-                Err(e) => {
-                    if e.is_incomplete() {
-                        self.start_idx = src.len();
-
-                        Ok(None)
-                    } else {
-                        Err(io::Error::new(
-                            ErrorKind::InvalidData,
-                            "invalid data in stream",
-                        ))
-                    }
-                }
-            }
-        } else {
-            Ok(None)
+            return;
         }
-    }
+    };
+
+    db.decrby(key, decrement, buf).unwrap();
 }
 
-struct LengthFinder(usize);
-
-impl Write for LengthFinder {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 += buf.len();
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+fn handle_get(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.get(&args.into_iter().nth(1).unwrap(), buf).unwrap();
 }
 
-fn handle_decr(db: &Database, args: &[String]) -> RespData {
-    db.decr(args[0].clone())
+fn handle_getset(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.getset(args[0].clone(), args[1].clone(), buf).unwrap();
 }
 
-fn handle_decrby(db: &Database, args: &[String]) -> RespData {
-    db.decrby(args[0].clone(), args[1].parse().unwrap())
+fn handle_incr(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.incr(args[0].clone(), buf).unwrap();
 }
 
-fn handle_get(db: &Database, args: &[String]) -> RespData {
-    db.get(args[0].as_str())
+fn handle_incrby(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let increment = match args[1].parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    db.incrby(args[0].clone(), increment, buf).unwrap();
 }
 
-fn handle_getset(db: &Database, args: &[String]) -> RespData {
-    db.getset(args[0].clone(), args[1].clone())
+fn handle_mget(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.mget(&args[1..], buf).unwrap();
 }
 
-fn handle_incr(db: &Database, args: &[String]) -> RespData {
-    db.incr(args[0].clone())
+fn handle_set(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+    let value = iter.next().unwrap();
+
+    db.set(key, value, buf).unwrap();
 }
 
-fn handle_incrby(db: &Database, args: &[String]) -> RespData {
-    db.incrby(args[0].clone(), args[1].parse().unwrap())
+fn handle_setnx(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+    let value = iter.next().unwrap();
+
+    db.setnx(key, value, buf).unwrap();
 }
 
-fn handle_mget(db: &Database, args: &[String]) -> RespData {
-    db.mget(args)
+fn handle_lindex(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let index = match args[2].parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    db.lindex(args[1].as_str(), index, buf).unwrap();
 }
 
-fn handle_set(db: &Database, args: &[String]) -> RespData {
-    db.set(args[0].clone(), args[1].clone())
+fn handle_llen(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.llen(args[1].as_str(), buf).unwrap();
 }
 
-fn handle_setnx(db: &Database, args: &[String]) -> RespData {
-    db.setnx(args[0].clone(), args[1].clone())
+fn handle_lpop(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.lpop(args[1].as_str(), buf).unwrap();
 }
 
-fn handle_lindex(db: &Database, args: &[String]) -> RespData {
-    db.lindex(args[0].as_str(), args[1].parse().unwrap())
+fn handle_lpush(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+    let value = iter.next().unwrap();
+
+    db.lpush(key, value, buf).unwrap();
 }
 
-fn handle_llen(db: &Database, args: &[String]) -> RespData {
-    db.llen(args[0].as_str())
+fn handle_lrange(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let start = match args[1].parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    let stop = match args[2].parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    db.lrange(args[1].as_str(), start, stop, buf).unwrap();
 }
 
-fn handle_lpop(db: &Database, args: &[String]) -> RespData {
-    db.lpop(args[0].as_str())
+fn handle_lrem(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let count = match args[2].parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    db.lrem(args[1].as_str(), count, args[3].as_str(), buf)
+        .unwrap();
 }
 
-fn handle_lpush(db: &Database, args: &[String]) -> RespData {
-    db.lpush(args[0].clone(), args[1].clone())
+fn handle_lset(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+
+    let index = match iter.next().unwrap().parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    let value = iter.next().unwrap();
+
+    db.lset(&key, index, value, buf).unwrap();
 }
 
-fn handle_lrange(db: &Database, args: &[String]) -> RespData {
-    db.lrange(
-        args[0].as_str(),
-        args[1].parse().unwrap(),
-        args[2].parse().unwrap(),
-    )
+fn handle_ltrim(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+
+    let start = match iter.next().unwrap().parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    let stop = match iter.next().unwrap().parse() {
+        Ok(i) => i,
+        Err(_) => {
+            buf.write_all(b"-ERR value is not an integer or out of range\r\n")
+                .unwrap();
+
+            return;
+        }
+    };
+
+    db.ltrim(&key, start, stop, buf).unwrap();
 }
 
-fn handle_lrem(db: &Database, args: &[String]) -> RespData {
-    db.lrem(args[0].as_str(), args[1].parse().unwrap(), args[2].as_str())
+fn handle_rpop(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.rpop(args[1].as_str(), buf).unwrap();
 }
 
-fn handle_lset(db: &Database, args: &[String]) -> RespData {
-    db.lset(args[0].as_str(), args[1].parse().unwrap(), args[2].clone())
+fn handle_rpush(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    let mut iter = args.into_iter().skip(1);
+    let key = iter.next().unwrap();
+    let value = iter.next().unwrap();
+
+    db.rpush(key, value, buf).unwrap();
 }
 
-fn handle_ltrim(db: &Database, args: &[String]) -> RespData {
-    db.ltrim(
-        args[0].as_str(),
-        args[1].parse().unwrap(),
-        args[2].parse().unwrap(),
-    )
+fn handle_del(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.del(&args, buf).unwrap();
 }
 
-fn handle_rpop(db: &Database, args: &[String]) -> RespData {
-    db.rpop(args[0].as_str())
+fn handle_exists(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
+    db.exists(args[0].as_str(), buf).unwrap();
 }
 
-fn handle_rpush(db: &Database, args: &[String]) -> RespData {
-    db.rpush(args[0].clone(), args[1].clone())
-}
-
-fn handle_del(db: &Database, args: &[String]) -> RespData {
-    db.del(args)
-}
-
-fn handle_exists(db: &Database, args: &[String]) -> RespData {
-    db.exists(args[0].as_str())
-}
-
-fn handle_ping(_: &Database, _: &[String]) -> RespData {
-    RespData::SimpleString("PONG".to_string())
+fn handle_ping(_: &Database, _: Vec<String>, buf: &mut Vec<u8>) {
+    buf.write_all(b"+PONG\r\n").unwrap();
 }
