@@ -29,7 +29,6 @@ use std::{cmp, collections::VecDeque, mem, sync::Arc};
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use lock_api::RwLockUpgradableReadGuard;
 use parking_lot::RwLock;
-use tokio::prelude::{future::Future, *};
 
 pub enum Value {
     String(String),
