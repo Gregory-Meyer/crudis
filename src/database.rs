@@ -24,12 +24,21 @@
 
 use crate::resp::RespData;
 
-use std::{cmp, collections::VecDeque, mem, sync::Arc};
+use std::{
+    cmp,
+    collections::VecDeque,
+    mem,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use lock_api::RwLockUpgradableReadGuard;
 use parking_lot::RwLock;
-use tokio::timer::Delay;
+use tokio::{
+    prelude::{future::Future, *},
+    timer::Delay,
+};
 
 pub enum Value {
     String(String),
@@ -38,15 +47,17 @@ pub enum Value {
     Hash(HashMap<String, String>),
 }
 
+type Bucket = (Value, Option<Box<dyn Future<Item = (), Error = ()>>>);
+
 impl Value {
-    fn new(value: Value) -> Arc<RwLock<(Value, Option<Delay>)>> {
+    fn new(value: Value) -> Arc<RwLock<Bucket>> {
         Arc::new(RwLock::new((value, None)))
     }
 }
 
 #[derive(Clone)]
 pub struct Database {
-    map: Arc<RwLock<HashMap<String, Arc<RwLock<(Value, Option<Delay>)>>>>>,
+    map: Arc<RwLock<HashMap<String, Arc<RwLock<Bucket>>>>>,
 }
 
 impl Database {
