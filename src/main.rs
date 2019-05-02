@@ -25,123 +25,173 @@
 mod database;
 mod resp;
 
-use std::{env, net::SocketAddr};
+use database::Database;
+use resp::RespData;
 
+use std::{
+    env,
+    fmt::Write as FmtWrite,
+    io::Write,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+};
+
+use bytes::BytesMut;
+use hashbrown::HashMap;
 use tokio::{
-    io,
-    net::tcp::{TcpListener, TcpStream},
+    codec::{Decoder, Encoder, Framed},
+    io::{self, ErrorKind},
+    net::tcp::TcpListener,
     prelude::*,
 };
 
-use nom::Context;
+use lazy_static::lazy_static;
 
-struct CommandStream {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    has_failed: bool,
+struct RespCodec {
+    start_idx: usize,
 }
 
-impl CommandStream {
-    fn from_socket(stream: TcpStream) -> CommandStream {
-        CommandStream {
-            stream,
-            buf: Vec::with_capacity(4096),
-            has_failed: true,
-        }
-    }
-
-    fn try_parse(&mut self) -> Option<Vec<String>> {
-        match resp::parse_client_message(self.buf.as_slice()) {
-            Ok((rest, msg)) => {
-                let to_trim = self.buf.len() - rest.len();
-                self.buf.drain(..to_trim);
-
-                return Some(msg);
-            }
-            Err(e) => match e {
-                nom::Err::Incomplete(_) => self.has_failed = true,
-                nom::Err::Error(c) | nom::Err::Failure(c) => {
-                    let last_parsed_idx = match c {
-                        Context::Code(i, _) => self.buf.len() - i.len(),
-                    };
-
-                    match self
-                        .buf
-                        .iter()
-                        .skip(last_parsed_idx)
-                        .position(|b| *b == b'\n')
-                    {
-                        Some(i) => {
-                            self.buf.drain(..i + 1);
-                        }
-                        None => self.buf.clear(),
-                    }
-                }
-            },
-        }
-
-        None
+impl RespCodec {
+    fn new() -> RespCodec {
+        RespCodec { start_idx: 0 }
     }
 }
 
-impl Stream for CommandStream {
+impl Decoder for RespCodec {
     type Item = Vec<String>;
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut new_buf = [0; 4096];
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if let Some(_) = src[self.start_idx..].iter().position(|b| *b == b'\n') {
+            match resp::parse_client_message(src.as_ref()) {
+                Ok((rest, msg)) => {
+                    let to_trim = src.len() - rest.len();
+                    src.advance(to_trim);
+                    self.start_idx = 0;
 
-        eprintln!(
-            "[{:?}] poll: self.buf = {:?}",
-            std::time::Instant::now(),
-            self.buf
-        );
+                    Ok(Some(msg))
+                }
+                Err(e) => {
+                    if e.is_incomplete() {
+                        self.start_idx = src.len();
 
-        loop {
-            if !self.has_failed {
-                if let Some(msg) = self.try_parse() {
-                    return Ok(Async::Ready(Some(msg)));
+                        Ok(None)
+                    } else {
+                        Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "invalid data in stream",
+                        ))
+                    }
                 }
             }
-
-            let num_read = match self.stream.poll_read(&mut new_buf)? {
-                Async::Ready(n) => n,
-                Async::NotReady => return Ok(Async::NotReady),
-            };
-
-            if num_read == 0 {
-                continue;
-            }
-
-            self.has_failed = false;
-            self.buf.extend_from_slice(&new_buf[..num_read]);
+        } else {
+            Ok(None)
         }
     }
+}
+
+struct LengthFinder(usize);
+
+impl Write for LengthFinder {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Encoder for RespCodec {
+    type Item = RespData;
+    type Error = io::Error;
+
+    fn encode(&mut self, data: RespData, dest: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut length_finder = LengthFinder(0);
+        write!(&mut length_finder, "{}", data).unwrap();
+        dest.reserve(length_finder.0);
+
+        write!(dest, "{}", data).unwrap();
+
+        Ok(())
+    }
+}
+
+type Handler = fn(&Database, &[String]) -> RespData;
+
+lazy_static! {
+    static ref COMMANDS: HashMap<&'static str, (usize, Handler)> = {
+        let mut commands = HashMap::new();
+        commands.insert("get", (1, handle_get as Handler));
+        commands.insert("set", (2, handle_set as Handler));
+        commands.insert("ping", (0, handle_ping as Handler));
+
+        commands
+    };
+}
+
+fn make_response(db: &Database, msg: &[String]) -> RespData {
+    assert!(!msg.is_empty());
+
+    let command = msg[0].to_lowercase();
+
+    if let Some((arity, f)) = COMMANDS.get(command.as_str()) {
+        if msg.len() != arity + 1 {
+            let msg = format!("ERR wrong number of arguments for '{}' command", command);
+
+            RespData::Error(msg)
+        } else {
+            f(db, &msg[1..])
+        }
+    } else {
+        let msg = format!("ERR unknown command `{}`", msg[0]);
+
+        RespData::Error(msg)
+    }
+}
+
+fn handle_get(db: &Database, args: &[String]) -> RespData {
+    db.get(args[0].as_str())
+}
+
+fn handle_set(db: &Database, args: &[String]) -> RespData {
+    db.set(args[0].clone(), args[1].clone())
+}
+
+fn handle_ping(_: &Database, _: &[String]) -> RespData {
+    RespData::SimpleString("PONG".to_string())
 }
 
 fn main() {
     let addr = env::args()
         .nth(1)
-        .unwrap_or_else(|| "[::1]:6379".to_string())
-        .parse::<SocketAddr>()
-        .expect("couldn't parse string as an address");
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| {
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
+                6379,
+                0,
+                0,
+            ))
+        });
+
     let listener = TcpListener::bind(&addr).expect("couldn't bind TCP listener");
+    let db = Database::new();
 
     let server = listener
         .incoming()
         .map_err(|e| eprintln!("couldn't accept a TCP connection: {}", e))
-        .for_each(|sock| {
-            let stream = CommandStream::from_socket(sock);
+        .for_each(move |sock| {
+            let (writer, reader) = Framed::new(sock, RespCodec::new()).split();
 
+            let db = db.clone();
             tokio::spawn(
-                stream
-                    .for_each(|msg| {
-                        println!("received a message: '{:?}'", msg);
-                        Ok(())
-                    })
-                    .map_err(|e| {
-                        eprintln!("couldn't parse message: {}", e);
-                    }),
+                reader
+                    .map(move |msg| make_response(&db, &msg))
+                    .forward(writer)
+                    .map(|_| ())
+                    .map_err(|e| eprintln!("couldn't write response: {}", e)),
             )
         });
 

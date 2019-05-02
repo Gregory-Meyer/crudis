@@ -26,10 +26,10 @@ use std::{
     cmp::Eq,
     error::Error,
     fmt::{self, Display, Formatter},
-    str::{self, FromStr},
+    str::{self, FromStr, Utf8Error},
 };
 
-use nom::{count, do_parse, map_res, named, tag, take, take_until_and_consume};
+use nom::{count, do_parse, map_res, named, switch, tag, take, take_until_and_consume, peek};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
@@ -93,17 +93,17 @@ mod parse {
     );
 } // mod parse
 
-named!(pub parse_client_message<&[u8], Vec<String>>, do_parse!(
-    tag!("*") >>
-    len: map_res!(
-        map_res!(
-            take_until_and_consume!("\r\n"),
-            str::from_utf8
-        ),
-        str::parse::<usize>
-    ) >>
-    elems: count!(do_parse!(
-        tag!("$") >>
+fn split_trim(bytes: &[u8]) -> Result<Vec<String>, Utf8Error> {
+    Ok(str::from_utf8(bytes)?
+        .split_whitespace()
+        .map(|s| s.trim())
+        .map(String::from)
+        .collect())
+}
+
+named!(pub parse_client_message<&[u8], Vec<String>>, switch!(peek!(take!(1)),
+    b"*" => do_parse!(
+        tag!("*") >>
         len: map_res!(
             map_res!(
                 take_until_and_consume!("\r\n"),
@@ -111,11 +111,25 @@ named!(pub parse_client_message<&[u8], Vec<String>>, do_parse!(
             ),
             str::parse::<usize>
         ) >>
-        data: map_res!(take!(len), str::from_utf8) >>
-        tag!("\r\n") >>
-        (String::from(data))
-    ), len) >>
-    (elems)
+        elems: count!(do_parse!(
+            tag!("$") >>
+            len: map_res!(
+                map_res!(
+                    take_until_and_consume!("\r\n"),
+                    str::from_utf8
+                ),
+                str::parse::<usize>
+            ) >>
+            data: map_res!(take!(len), str::from_utf8) >>
+            tag!("\r\n") >>
+            (String::from(data))
+        ), len) >>
+        (elems)
+    ) |
+    _ => map_res!(
+        take_until_and_consume!("\n"),
+        split_trim
+    )
 ));
 
 impl FromStr for RespData {
@@ -379,6 +393,15 @@ mod tests {
         let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec!["LLEN".into(), "mylist".into()])
+        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
+    }
+
+    #[test]
+    fn parse_inline() {
+        let msg = b"LLEN mylist\r\n";
+        let (rest, parsed) = parse_client_message(msg).unwrap();
+
+        assert!(rest.is_empty());
+        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
     }
 }
