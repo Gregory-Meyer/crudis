@@ -100,6 +100,7 @@ fn start() -> i32 {
 fn client_loop(db: Database, mut socket: TcpStream) {
     let mut start_idx = 0;
     let mut buf = Vec::with_capacity(4096);
+    let mut output_buf = Vec::with_capacity(4096);
 
     loop {
         if let Some(_) = buf[start_idx..].iter().position(|b| *b == b'\n') {
@@ -107,9 +108,10 @@ fn client_loop(db: Database, mut socket: TcpStream) {
             start_idx = new_start_idx;
 
             if let Some(msg) = maybe_msg {
-                let response = make_response(&db, msg);
+                output_buf.clear();
+                make_response(&db, msg, &mut output_buf);
 
-                if let Err(e) = socket.write_all(&response) {
+                if let Err(e) = socket.write_all(&output_buf) {
                     if e.kind() == ErrorKind::ConnectionReset {
                         return;
                     }
@@ -168,26 +170,24 @@ fn main() {
     }
 }
 
-fn make_response(db: &Database, msg: Vec<String>) -> Vec<u8> {
+fn make_response(db: &Database, msg: Vec<String>, response: &mut Vec<u8>) {
     assert!(!msg.is_empty());
 
     let command = msg[0].to_lowercase();
 
     if let Some((arity, f)) = get_command(command.as_str()) {
         if (arity != -1) && (msg.len() != (arity as usize) + 1) {
-            format!(
+            write!(
+                response,
                 "-ERR wrong number of arguments for '{}' command\r\n",
                 command
             )
-            .into_bytes()
+            .unwrap();
         } else {
-            let mut response = Vec::new();
-            f(db, msg, &mut response);
-
-            response
+            f(db, msg, response);
         }
     } else {
-        format!("-ERR unknown command {}\r\n", Command(&msg)).into_bytes()
+        write!(response, "-ERR unknown command {}\r\n", Command(&msg)).unwrap();
     }
 }
 
@@ -335,7 +335,7 @@ fn handle_lpush(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
 }
 
 fn handle_lrange(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
-    let start = match args[1].parse() {
+    let start = match args[2].parse() {
         Ok(i) => i,
         Err(_) => {
             buf.write_all(b"-ERR value is not an integer or out of range\r\n")
@@ -345,7 +345,7 @@ fn handle_lrange(db: &Database, args: Vec<String>, buf: &mut Vec<u8>) {
         }
     };
 
-    let stop = match args[2].parse() {
+    let stop = match args[3].parse() {
         Ok(i) => i,
         Err(_) => {
             buf.write_all(b"-ERR value is not an integer or out of range\r\n")
