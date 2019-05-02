@@ -13,3 +13,7 @@ lock_api = "0.1"
 nom = "4.2"
 parking_lot = "0.7"
 tokio = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
