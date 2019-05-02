@@ -30,8 +30,8 @@ use resp::RespData;
 
 use std::{
     env,
-    fmt::{self, Write as FmtWrite, Formatter},
     fmt::Display,
+    fmt::{self, Formatter, Write as FmtWrite},
     io::Write,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
 };
@@ -46,6 +46,9 @@ use tokio::{
 };
 
 use lazy_static::lazy_static;
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 struct RespCodec {
     start_idx: usize,
@@ -176,6 +179,17 @@ fn make_response(db: &Database, msg: &[String]) -> RespData {
 
             RespData::Error(msg)
         } else {
+            let mut args = String::with_capacity(
+                msg.iter().map(String::len).fold(0, |x, y| x + y) + msg.len() - 1,
+            );
+
+            write!(args, "{}", msg[0]).unwrap();
+
+            for elem in msg[1..].iter() {
+                write!(args, " {}", elem).unwrap();
+            }
+
+            println!("{}", args);
             f(db, &msg[1..])
         }
     } else {
@@ -238,7 +252,11 @@ fn handle_lpush(db: &Database, args: &[String]) -> RespData {
 }
 
 fn handle_lrange(db: &Database, args: &[String]) -> RespData {
-    db.lrange(args[0].as_str(), args[1].parse().unwrap(), args[2].parse().unwrap())
+    db.lrange(
+        args[0].as_str(),
+        args[1].parse().unwrap(),
+        args[2].parse().unwrap(),
+    )
 }
 
 fn handle_lrem(db: &Database, args: &[String]) -> RespData {
@@ -250,7 +268,11 @@ fn handle_lset(db: &Database, args: &[String]) -> RespData {
 }
 
 fn handle_ltrim(db: &Database, args: &[String]) -> RespData {
-    db.ltrim(args[0].as_str(), args[1].parse().unwrap(), args[2].parse().unwrap())
+    db.ltrim(
+        args[0].as_str(),
+        args[1].parse().unwrap(),
+        args[2].parse().unwrap(),
+    )
 }
 
 fn handle_rpop(db: &Database, args: &[String]) -> RespData {
@@ -293,6 +315,8 @@ fn main() {
         .incoming()
         .map_err(|e| eprintln!("couldn't accept a TCP connection: {}", e))
         .for_each(move |sock| {
+            println!("connected to {}", sock.peer_addr().unwrap());
+
             let (writer, reader) = Framed::new(sock, RespCodec::new()).split();
 
             let db = db.clone();

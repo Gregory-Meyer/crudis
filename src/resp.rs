@@ -29,7 +29,7 @@ use std::{
     str::{self, FromStr, Utf8Error},
 };
 
-use nom::{count, do_parse, map_res, named, switch, tag, take, take_until_and_consume, peek};
+use nom::{count, do_parse, map_res, named, peek, switch, tag, take, take_until_and_consume};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
