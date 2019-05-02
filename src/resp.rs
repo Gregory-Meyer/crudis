@@ -64,7 +64,47 @@ pub struct BulkStringRef<'a>(pub &'a str);
 
 impl<'a> Display for BulkStringRef<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "${}\r\n{}\r\n", self.0.len(), self.0)
+        static PREFIXES: [&'static str; 33] = [
+            "$0\r\n",
+            "$1\r\n",
+            "$2\r\n",
+            "$3\r\n",
+            "$4\r\n",
+            "$5\r\n",
+            "$6\r\n",
+            "$7\r\n",
+            "$8\r\n",
+            "$9\r\n",
+            "$10\r\n",
+            "$11\r\n",
+            "$12\r\n",
+            "$13\r\n",
+            "$14\r\n",
+            "$15\r\n",
+            "$16\r\n",
+            "$17\r\n",
+            "$18\r\n",
+            "$19\r\n",
+            "$20\r\n",
+            "$21\r\n",
+            "$22\r\n",
+            "$23\r\n",
+            "$24\r\n",
+            "$25\r\n",
+            "$26\r\n",
+            "$27\r\n",
+            "$28\r\n",
+            "$29\r\n",
+            "$30\r\n",
+            "$31\r\n",
+            "$32\r\n",
+        ];
+
+        if self.0.len() < PREFIXES.len() {
+            write!(f, "{}{}\r\n", PREFIXES[self.0.len()], self.0)
+        } else {
+            write!(f, "${}\r\n{}\r\n", self.0.len(), self.0)
+        }
     }
 }
 
@@ -206,10 +246,10 @@ impl Display for RespData {
         use RespData::*;
 
         match self {
-            SimpleString(s) => write!(f, "+{}\r\n", s),
-            Error(e) => write!(f, "-{}\r\n", e),
+            SimpleString(s) => SimpleStringRef(&s).fmt(f),
+            Error(e) => ErrorRef(&e).fmt(f),
             Integer(i) => write!(f, ":{}\r\n", i),
-            BulkString(i) => write!(f, "${}\r\n{}\r\n", i.len(), i),
+            BulkString(s) => BulkStringRef(&s).fmt(f),
             Nil => write!(f, "$-1\r\n"),
             Array(d) => {
                 write!(f, "*{}\r\n", d.len())?;
