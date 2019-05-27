@@ -27,18 +27,91 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     str::{self, FromStr, Utf8Error},
+    io::{self, Write},
 };
 
 use nom::{count, do_parse, map_res, named, peek, switch, tag, take, take_until_and_consume};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
-    SimpleString(String),
-    Error(String),
+    SimpleString(Vec<u8>),
+    Error(Vec<u8>),
     Integer(i64),
-    BulkString(String),
+    BulkString(Vec<u8>),
     Nil,
     Array(Vec<RespData>),
+}
+
+impl RespData {
+    pub fn serialize(&self) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(self.serialized_len());
+        self.write_to(&mut buffer)?;
+
+        Ok(buffer)
+    }
+
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            RespData::SimpleString(s) => {
+                writer.write_all(b"+")?;
+                writer.write_all(s)?;
+                writer.write_all(b"\r\n")
+            },
+            RespData::Error(e) => {
+                writer.write_all(b"-")?;
+                writer.write_all(e)?;
+                writer.write_all(b"\r\n")
+            },
+            RespData::Integer(i) => {
+                writer.write_all(b":")?;
+                write!(writer, "{}", i)?;
+                writer.write_all(b"\r\n")
+            },
+            RespData::BulkString(s) => {
+                write!(writer, "${}\r\n", s.len())?;
+                writer.write_all(s)?;
+                writer.write_all(b"\r\n")
+            },
+            RespData::Nil => {
+                writer.write_all(b"$-1\r\n")
+            }
+            RespData::Array(a) => {
+                write!(writer, "*{}\r\n", a.len())?;
+
+                for elem in a.iter() {
+                    elem.write_to(writer)?;
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn serialized_len(&self) -> usize {
+        match self {
+            RespData::SimpleString(s) | RespData::Error(s) => s.len() + 3,
+            RespData::Integer(i) => {
+                let num_ser_bits = serialized_len(i.abs() as usize);
+
+                num_ser_bits + 3 + if *i < 0 { 1 } else { 0 }
+            }
+            RespData::BulkString(s) =>
+                s.len() + serialized_len(s.len()) + 5,
+            RespData::Nil => 5,
+            RespData::Array(a) =>
+                a.iter()
+                    .map(RespData::serialized_len)
+                    .fold(3 + serialized_len(a.len()), |x, y| x + y)
+        }
+    }
+}
+
+fn serialized_len(num: usize) -> usize {
+    if num == 0 {
+        return 1;
+    }
+
+    ((num + 1) as f64).log10().ceil() as usize
 }
 
 impl Eq for RespData {}
@@ -49,59 +122,59 @@ mod parse {
         alt, call, count, do_parse, map_res, named, switch, tag, take, take_until_and_consume,
     };
 
-    named!(simple_string<&str, RespData>, do_parse!(
+    named!(simple_string<RespData>, do_parse!(
         data: take_until_and_consume!("\r\n") >>
         (RespData::SimpleString(data.into()))
     ));
 
-    named!(error<&str, RespData>, do_parse!(
+    named!(error<RespData>, do_parse!(
         data: take_until_and_consume!("\r\n") >>
         (RespData::Error(data.into()))
     ));
 
-    named!(integer<&str, RespData>, do_parse!(
-        value: map_res!(take_until_and_consume!("\r\n"), str::parse) >>
+    named!(integer<RespData>, do_parse!(
+        value: map_res!(map_res!(take_until_and_consume!("\r\n"), str::from_utf8), str::parse::<i64>) >>
         (RespData::Integer(value))
     ));
 
-    named!(bulk_string<&str, RespData>, do_parse!(
-        len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+    named!(bulk_string<RespData>, do_parse!(
+        len: map_res!(map_res!(take_until_and_consume!("\r\n"), str::from_utf8), str::parse::<usize>) >>
         data: take!(len) >>
         tag!("\r\n") >>
         (RespData::BulkString(data.into()))
     ));
 
-    named!(nil<&str, RespData>, do_parse!(
+    named!(nil<RespData>, do_parse!(
         tag!("-1\r\n") >>
         (RespData::Nil)
     ));
 
-    named!(array<&str, RespData>, do_parse!(
-        len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
+    named!(array<RespData>, do_parse!(
+        len: map_res!(map_res!(take_until_and_consume!("\r\n"), str::from_utf8), str::parse::<usize>) >>
         results: count!(resp, len) >>
         (RespData::Array(results))
     ));
 
-    named!(pub resp<&str, RespData>,
+    named!(pub resp<RespData>,
         switch!(take!(1),
-            "+" => call!(simple_string) |
-            "-" => call!(error) |
-            ":" => call!(integer) |
-            "$" => alt!(call!(nil) | call!(bulk_string)) |
-            "*" => call!(array)
+            b"+" => call!(simple_string) |
+            b"-" => call!(error) |
+            b":" => call!(integer) |
+            b"$" => alt!(call!(nil) | call!(bulk_string)) |
+            b"*" => call!(array)
         )
     );
 } // mod parse
 
-fn split_trim(bytes: &[u8]) -> Result<Vec<String>, Utf8Error> {
+fn split_trim(bytes: &[u8]) -> Result<Vec<&[u8]>, Utf8Error> {
     Ok(str::from_utf8(bytes)?
         .split_whitespace()
         .map(|s| s.trim())
-        .map(String::from)
+        .map(|s| s.as_bytes())
         .collect())
 }
 
-named!(pub parse_client_message<&[u8], Vec<String>>, switch!(peek!(take!(1)),
+named!(pub parse_client_message<&[u8], Vec<&[u8]>>, switch!(peek!(take!(1)),
     b"*" => do_parse!(
         tag!("*") >>
         len: map_res!(
@@ -120,9 +193,9 @@ named!(pub parse_client_message<&[u8], Vec<String>>, switch!(peek!(take!(1)),
                 ),
                 str::parse::<usize>
             ) >>
-            data: map_res!(take!(len), str::from_utf8) >>
+            data: take!(len) >>
             tag!("\r\n") >>
-            (String::from(data))
+            (data)
         ), len) >>
         (elems)
     ) |
@@ -136,7 +209,7 @@ impl FromStr for RespData {
     type Err = ParseRespError;
 
     fn from_str(s: &str) -> Result<RespData, ParseRespError> {
-        match parse::resp(s) {
+        match parse::resp(s.as_bytes()) {
             Ok((rem, res)) => {
                 if rem.is_empty() {
                     Ok(res)
@@ -176,57 +249,54 @@ impl Display for ParseRespError {
     }
 }
 
-impl Display for RespData {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        use RespData::*;
-
-        match self {
-            SimpleString(s) => write!(f, "+{}\r\n", s),
-            Error(e) => write!(f, "-{}\r\n", e),
-            Integer(i) => write!(f, ":{}\r\n", i),
-            BulkString(i) => write!(f, "${}\r\n{}\r\n", i.len(), i),
-            Nil => write!(f, "$-1\r\n"),
-            Array(d) => {
-                write!(f, "*{}\r\n", d.len())?;
-
-                for elem in d.iter() {
-                    elem.fmt(f)?;
-                }
-
-                Ok(())
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use RespData::*;
 
     fn fmt_eq(resp: &RespData, expected: &str) {
-        let actual = format!("{}", resp);
-        assert_eq!(actual, expected);
+        let serialized = resp.serialize().unwrap();
+
+        assert_eq!(serialized.len(), resp.serialized_len());
+        assert_eq!(serialized, expected.as_bytes());
     }
 
     #[test]
     fn fmt_simple_string() {
-        fmt_eq(&SimpleString("OK".to_string()), "+OK\r\n");
+        fmt_eq(&SimpleString("OK".into()), "+OK\r\n");
     }
 
     #[test]
     fn fmt_error() {
-        fmt_eq(&Error("Error message".to_string()), "-Error message\r\n");
+        fmt_eq(&Error("Error message".into()), "-Error message\r\n");
 
         fmt_eq(
-            &Error("ERR unknown command 'foobar'".to_string()),
+            &Error("ERR unknown command 'foobar'".into()),
             "-ERR unknown command 'foobar'\r\n",
         );
 
         fmt_eq(
-            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
             "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
         );
+    }
+
+    #[test]
+    fn iserlen() {
+        for i in 0..10 {
+            println!("i = {}", i);
+            assert_eq!(serialized_len(i), 1);
+        }
+
+        for i in 10..100 {
+            println!("i = {}", i);
+            assert_eq!(serialized_len(i), 2);
+        }
+
+        for i in 100..1000 {
+            println!("i = {}", i);
+            assert_eq!(serialized_len(i), 3);
+        }
     }
 
     #[test]
@@ -240,9 +310,9 @@ mod tests {
 
     #[test]
     fn fmt_bulk_string() {
-        fmt_eq(&BulkString("foobar".to_string()), "$6\r\nfoobar\r\n");
+        fmt_eq(&BulkString("foobar".into()), "$6\r\nfoobar\r\n");
 
-        fmt_eq(&BulkString("".to_string()), "$0\r\n\r\n");
+        fmt_eq(&BulkString("".into()), "$0\r\n\r\n");
     }
 
     #[test]
@@ -256,8 +326,8 @@ mod tests {
 
         fmt_eq(
             &Array(vec![
-                BulkString("foo".to_string()),
-                BulkString("bar".to_string()),
+                BulkString("foo".into()),
+                BulkString("bar".into()),
             ]),
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
         );
@@ -273,24 +343,24 @@ mod tests {
                 Integer(2),
                 Integer(3),
                 Integer(4),
-                BulkString("foobar".to_string()),
+                BulkString("foobar".into()),
             ]),
             "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n",
         );
 
         fmt_eq(
             &Array(vec![
-                BulkString("foo".to_string()),
+                BulkString("foo".into()),
                 Nil,
-                BulkString("bar".to_string()),
+                BulkString("bar".into()),
             ]),
             "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n",
         );
 
         fmt_eq(
             &Array(vec![
-                BulkString("LLEN".to_string()),
-                BulkString("mylist".to_string()),
+                BulkString("LLEN".into()),
+                BulkString("mylist".into()),
             ]),
             "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n",
         )
@@ -302,21 +372,21 @@ mod tests {
 
     #[test]
     fn parse_simple_string() {
-        parse_eq("+OK\r\n", &SimpleString("OK".to_string()));
+        parse_eq("+OK\r\n", &SimpleString("OK".into()));
     }
 
     #[test]
     fn parse_error() {
-        parse_eq("-Error message\r\n", &Error("Error message".to_string()));
+        parse_eq("-Error message\r\n", &Error("Error message".into()));
 
         parse_eq(
             "-ERR unknown command 'foobar'\r\n",
-            &Error("ERR unknown command 'foobar'".to_string()),
+            &Error("ERR unknown command 'foobar'".into()),
         );
 
         parse_eq(
             "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
         );
     }
 
@@ -331,9 +401,9 @@ mod tests {
 
     #[test]
     fn parse_bulk_string() {
-        parse_eq("$6\r\nfoobar\r\n", &BulkString("foobar".to_string()));
+        parse_eq("$6\r\nfoobar\r\n", &BulkString("foobar".into()));
 
-        parse_eq("$0\r\n\r\n", &BulkString("".to_string()));
+        parse_eq("$0\r\n\r\n", &BulkString("".into()));
     }
 
     #[test]
@@ -348,8 +418,8 @@ mod tests {
         parse_eq(
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             &Array(vec![
-                BulkString("foo".to_string()),
-                BulkString("bar".to_string()),
+                BulkString("foo".into()),
+                BulkString("bar".into()),
             ]),
         );
 
@@ -365,24 +435,24 @@ mod tests {
                 Integer(2),
                 Integer(3),
                 Integer(4),
-                BulkString("foobar".to_string()),
+                BulkString("foobar".into()),
             ]),
         );
 
         parse_eq(
             "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n",
             &Array(vec![
-                BulkString("foo".to_string()),
+                BulkString("foo".into()),
                 Nil,
-                BulkString("bar".to_string()),
+                BulkString("bar".into()),
             ]),
         );
 
         parse_eq(
             "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n",
             &Array(vec![
-                BulkString("LLEN".to_string()),
-                BulkString("mylist".to_string()),
+                BulkString("LLEN".into()),
+                BulkString("mylist".into()),
             ]),
         )
     }
@@ -393,7 +463,7 @@ mod tests {
         let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
+        assert_eq!(parsed, vec!["LLEN".as_bytes(), "mylist".as_bytes()])
     }
 
     #[test]
@@ -402,6 +472,6 @@ mod tests {
         let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
+        assert_eq!(parsed, vec!["LLEN".as_bytes(), "mylist".as_bytes()])
     }
 }
