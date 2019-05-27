@@ -22,9 +22,9 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::resp::RespData;
+use crate::resp::{BulkStringRef, ErrorRef, RespData, SimpleStringRef};
 
-use std::{cmp, collections::VecDeque, mem, sync::Arc};
+use std::{cmp, collections::VecDeque, io, mem, sync::Arc};
 
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use lock_api::RwLockUpgradableReadGuard;
@@ -57,48 +57,59 @@ impl Database {
         }
     }
 
-    pub fn decr(&self, key: String) -> RespData {
-        self.decrby(key, 1)
+    pub fn decr<W: io::Write>(&self, key: String, writer: &mut W) -> io::Result<()> {
+        self.decrby(key, 1, writer)
     }
 
-    pub fn decrby(&self, key: String, decrement: i64) -> RespData {
-        self.rmw_integer(key, |x| x - decrement, || -decrement)
+    pub fn decrby<W: io::Write>(
+        &self,
+        key: String,
+        decrement: i64,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        self.rmw_integer(key, |x| x - decrement, || -decrement, writer)
     }
 
-    pub fn get(&self, key: &str) -> RespData {
+    pub fn get<W: io::Write>(&self, key: &str, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(v) = map.get(key) {
                 v.clone()
             } else {
-                return RespData::Nil;
+                return write!(writer, "{}", RespData::Nil);
             }
         };
 
         let bucket = bucket_ptr.read();
 
-        match &bucket.0 {
-            Value::String(s) => RespData::BulkString(s.clone()),
-            _ => Database::wrongtype(),
+        if let Value::String(value) = &bucket.0 {
+            write!(writer, "{}", BulkStringRef(value))
+        } else {
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn getset(&self, key: String, mut value: String) -> RespData {
+    pub fn getset<W: io::Write>(
+        &self,
+        key: String,
+        mut value: String,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.upgradable_read();
 
             if let Some(v) = map.get(&key) {
                 v.clone()
             } else {
-                let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+                let mut map = RwLockUpgradableReadGuard::upgrade(map);
 
-                match writer.entry(key) {
+                match map.entry(key) {
                     Entry::Occupied(_) => unreachable!(), // this should never happen
                     Entry::Vacant(e) => {
                         e.insert(Value::new(Value::String(value)));
 
-                        return RespData::Nil;
+                        return write!(writer, "{}", RespData::Nil);
                     }
                 }
             }
@@ -110,64 +121,66 @@ impl Database {
             Value::String(s) => {
                 mem::swap(s, &mut value);
 
-                RespData::BulkString(value)
+                write!(writer, "{}", BulkStringRef(&value))
             }
-            _ => Database::wrongtype(),
+            _ => write!(writer, "{}", Database::wrongtype()),
         }
     }
 
-    pub fn incr(&self, key: String) -> RespData {
-        self.incrby(key, 1)
+    pub fn incr<W: io::Write>(&self, key: String, writer: &mut W) -> io::Result<()> {
+        self.incrby(key, 1, writer)
     }
 
-    pub fn incrby(&self, key: String, increment: i64) -> RespData {
-        self.rmw_integer(key, |x| x + increment, || increment)
+    pub fn incrby<W: io::Write>(
+        &self,
+        key: String,
+        increment: i64,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        self.rmw_integer(key, |x| x + increment, || increment, writer)
     }
 
-    pub fn mget<S: AsRef<str>>(&self, keys: &[S]) -> RespData {
+    pub fn mget<S: AsRef<str>, W: io::Write>(&self, keys: &[S], writer: &mut W) -> io::Result<()> {
         let maybe_bucket_ptrs: Vec<_> = {
             let map = self.map.read();
 
-            keys.iter()
-                .map(|k| map.get(k.as_ref()).map(|v| v.clone()))
-                .collect()
+            keys.iter().map(|k| map.get(k.as_ref()).cloned()).collect()
         };
 
-        RespData::Array({
-            maybe_bucket_ptrs
-                .iter()
-                .map(|maybe_bucket_ptr| {
-                    if let Some(bucket_ptr) = maybe_bucket_ptr {
-                        let bucket = bucket_ptr.read();
+        write!(writer, "*{}\r\n", maybe_bucket_ptrs.len())?;
 
-                        if let Value::String(s) = &bucket.0 {
-                            RespData::BulkString(s.clone())
-                        } else {
-                            RespData::Nil
-                        }
-                    } else {
-                        RespData::Nil
-                    }
-                })
-                .collect()
-        })
+        for maybe_ptr in maybe_bucket_ptrs.into_iter() {
+            if let Some(ptr) = maybe_ptr {
+                let elem = ptr.read();
+
+                if let Value::String(s) = &elem.0 {
+                    write!(writer, "{}", BulkStringRef(&s))?;
+                } else {
+                    write!(writer, "{}", RespData::Nil)?;
+                }
+            } else {
+                write!(writer, "{}", RespData::Nil)?;
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn set(&self, key: String, value: String) -> RespData {
+    pub fn set<W: io::Write>(&self, key: String, value: String, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.upgradable_read();
 
             if let Some(v) = map.get(&key) {
                 v.clone()
             } else {
-                let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+                let mut map = RwLockUpgradableReadGuard::upgrade(map);
 
-                match writer.entry(key) {
+                match map.entry(key) {
                     Entry::Occupied(_) => unreachable!(), // should never happen, upgrade is atomic
                     Entry::Vacant(e) => {
                         e.insert(Value::new(Value::String(value)));
 
-                        return Database::ok();
+                        return write!(writer, "{}", Database::ok());
                     }
                 }
             }
@@ -180,36 +193,41 @@ impl Database {
             _ => bucket.0 = Value::String(value),
         }
 
-        Database::ok()
+        write!(writer, "{}", Database::ok())
     }
 
-    pub fn setnx(&self, key: String, value: String) -> RespData {
+    pub fn setnx<W: io::Write>(
+        &self,
+        key: String,
+        value: String,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let map = self.map.upgradable_read();
 
         if let Some(_) = map.get(&key) {
-            return RespData::Integer(0);
+            return write!(writer, "{}", RespData::Integer(0));
         }
 
-        let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+        let mut map = RwLockUpgradableReadGuard::upgrade(map);
 
-        match writer.entry(key) {
+        match map.entry(key) {
             Entry::Occupied(_) => unreachable!(), // should never happen, upgrade is atomic
             Entry::Vacant(e) => {
                 e.insert(Value::new(Value::String(value)));
 
-                RespData::Integer(1)
+                write!(writer, "{}", RespData::Integer(1))
             }
         }
     }
 
-    pub fn lindex(&self, key: &str, index: isize) -> RespData {
+    pub fn lindex<W: io::Write>(&self, key: &str, index: isize, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(b) = map.get(key) {
                 b.clone()
             } else {
-                return RespData::Nil;
+                return write!(writer, "{}", RespData::Nil);
             }
         };
 
@@ -223,43 +241,43 @@ impl Database {
             };
 
             if offset < 0 || offset as usize >= l.len() {
-                RespData::Nil
+                write!(writer, "{}", RespData::Nil)
             } else {
-                RespData::BulkString(l[offset as usize].clone())
+                write!(writer, "{}", BulkStringRef(&l[offset as usize]))
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn llen(&self, key: &str) -> RespData {
+    pub fn llen<W: io::Write>(&self, key: &str, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(b) = map.get(key) {
                 b.clone()
             } else {
-                return RespData::Integer(0);
+                return write!(writer, "{}", RespData::Integer(0));
             }
         };
 
         let bucket = bucket_ptr.read();
 
         if let Value::List(l) = &bucket.0 {
-            RespData::Integer(l.len() as i64)
+            write!(writer, "{}", RespData::Integer(l.len() as i64))
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn lpop(&self, key: &str) -> RespData {
+    pub fn lpop<W: io::Write>(&self, key: &str, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(b) = map.get(key) {
                 b.clone()
             } else {
-                return RespData::Nil;
+                return write!(writer, "{}", RespData::Nil);
             }
         };
 
@@ -267,25 +285,30 @@ impl Database {
 
         if let Value::List(l) = &mut bucket.0 {
             if let Some(v) = l.pop_front() {
-                RespData::BulkString(v)
+                write!(writer, "{}", BulkStringRef(&v))
             } else {
-                RespData::Nil
+                write!(writer, "{}", RespData::Nil)
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn lpush(&self, key: String, value: String) -> RespData {
+    pub fn lpush<W: io::Write>(
+        &self,
+        key: String,
+        value: String,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.upgradable_read();
 
             if let Some(v) = map.get(&key) {
                 v.clone()
             } else {
-                let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+                let mut map = RwLockUpgradableReadGuard::upgrade(map);
 
-                match writer.entry(key) {
+                match map.entry(key) {
                     Entry::Occupied(_) => unreachable!(), // should never happen, upgrade is atomic
                     Entry::Vacant(e) => {
                         let mut list = VecDeque::with_capacity(1);
@@ -293,7 +316,7 @@ impl Database {
 
                         e.insert(Value::new(Value::List(list)));
 
-                        return RespData::Integer(1);
+                        return write!(writer, "{}", RespData::Integer(1));
                     }
                 }
             }
@@ -304,20 +327,26 @@ impl Database {
         if let Value::List(list) = &mut bucket.0 {
             list.push_front(value);
 
-            RespData::Integer(list.len() as i64)
+            return write!(writer, "{}", RespData::Integer(list.len() as i64));
         } else {
-            Database::wrongtype()
+            return write!(writer, "{}", Database::wrongtype());
         }
     }
 
-    pub fn lrange(&self, key: &str, start: isize, stop: isize) -> RespData {
+    pub fn lrange<W: io::Write>(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(v) = map.get(key) {
                 v.clone()
             } else {
-                return RespData::Array(Vec::new());
+                return writer.write_all(b"*0\r\n");
             }
         };
 
@@ -340,32 +369,37 @@ impl Database {
             let stop_clamped = cmp::min(l.len() as isize, stop_offset) as usize;
 
             if start_clamped >= l.len() || start_clamped > stop_clamped {
-                RespData::Array(Vec::new())
+                writer.write_all(b"*0\r\n")
             } else {
                 let numel = stop_clamped + 1 - start_clamped;
 
-                let elems = l
-                    .iter()
-                    .skip(start_clamped)
-                    .take(numel)
-                    .cloned()
-                    .map(RespData::BulkString);
+                write!(writer, "*{}\r\n", numel)?;
 
-                RespData::Array(elems.collect())
+                for elem in l.iter().skip(start_clamped).take(numel) {
+                    write!(writer, "{}", BulkStringRef(elem))?;
+                }
+
+                Ok(())
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn lrem(&self, key: &str, count: isize, value: &str) -> RespData {
+    pub fn lrem<W: io::Write>(
+        &self,
+        key: &str,
+        count: isize,
+        value: &str,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(v) = map.get(key) {
                 v.clone()
             } else {
-                return RespData::Integer(0);
+                return write!(writer, "{}", RespData::Integer(0));
             }
         };
 
@@ -386,7 +420,7 @@ impl Database {
 
                 *l = new_list;
 
-                RespData::Integer(num_removed as i64)
+                write!(writer, "{}", RespData::Integer(num_removed as i64))
             } else if count < 0 {
                 let mut new_list = VecDeque::with_capacity(l.len());
                 let mut num_removed = 0;
@@ -401,27 +435,37 @@ impl Database {
 
                 *l = new_list;
 
-                RespData::Integer(num_removed as i64)
+                write!(writer, "{}", RespData::Integer(num_removed as i64))
             } else {
                 let before_len = l.len();
                 l.retain(|e| e != value);
                 let after_len = l.len();
 
-                RespData::Integer((before_len - after_len) as i64)
+                write!(
+                    writer,
+                    "{}",
+                    RespData::Integer((before_len - after_len) as i64)
+                )
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn lset(&self, key: &str, index: isize, value: String) -> RespData {
+    pub fn lset<W: io::Write>(
+        &self,
+        key: &str,
+        index: isize,
+        value: String,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(v) = map.get(key) {
                 v.clone()
             } else {
-                return Database::no_such_key();
+                return write!(writer, "{}", Database::no_such_key());
             }
         };
 
@@ -435,24 +479,30 @@ impl Database {
             };
 
             if offset < 0 || offset >= l.len() as isize {
-                Database::out_of_range()
+                write!(writer, "{}", Database::out_of_range())
             } else {
                 l[offset as usize] = value;
 
-                Database::ok()
+                write!(writer, "{}", Database::ok())
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn ltrim(&self, key: &str, start: isize, stop: isize) -> RespData {
+    pub fn ltrim<W: io::Write>(
+        &self,
+        key: &str,
+        start: isize,
+        stop: isize,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let map = self.map.upgradable_read();
 
         let bucket_ptr = if let Some(v) = map.get(key) {
             v.clone()
         } else {
-            return Database::ok();
+            return write!(writer, "{}", Database::ok());
         };
 
         let mut bucket = bucket_ptr.write();
@@ -484,20 +534,20 @@ impl Database {
                 l.drain(numel..);
             }
 
-            Database::ok()
+            write!(writer, "{}", Database::ok())
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn rpop(&self, key: &str) -> RespData {
+    pub fn rpop<W: io::Write>(&self, key: &str, writer: &mut W) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.read();
 
             if let Some(b) = map.get(key) {
                 b.clone()
             } else {
-                return RespData::Nil;
+                return write!(writer, "{}", RespData::Nil);
             }
         };
 
@@ -505,25 +555,30 @@ impl Database {
 
         if let Value::List(l) = &mut bucket.0 {
             if let Some(v) = l.pop_back() {
-                RespData::BulkString(v)
+                write!(writer, "{}", BulkStringRef(&v))
             } else {
-                RespData::Nil
+                write!(writer, "{}", RespData::Nil)
             }
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn rpush(&self, key: String, value: String) -> RespData {
+    pub fn rpush<W: io::Write>(
+        &self,
+        key: String,
+        value: String,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.upgradable_read();
 
             if let Some(v) = map.get(&key) {
                 v.clone()
             } else {
-                let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+                let mut map = RwLockUpgradableReadGuard::upgrade(map);
 
-                match writer.entry(key) {
+                match map.entry(key) {
                     Entry::Occupied(_) => unreachable!(), // should never happen, upgrade is atomic
                     Entry::Vacant(e) => {
                         let mut list = VecDeque::with_capacity(1);
@@ -531,7 +586,7 @@ impl Database {
 
                         e.insert(Value::new(Value::List(list)));
 
-                        return RespData::Integer(1);
+                        return write!(writer, "{}", RespData::Integer(1));
                     }
                 }
             }
@@ -542,67 +597,71 @@ impl Database {
         if let Value::List(list) = &mut bucket.0 {
             list.push_back(value);
 
-            RespData::Integer(list.len() as i64)
+            write!(writer, "{}", RespData::Integer(list.len() as i64))
         } else {
-            Database::wrongtype()
+            write!(writer, "{}", Database::wrongtype())
         }
     }
 
-    pub fn del<S: AsRef<str>>(&self, keys: &[S]) -> RespData {
+    pub fn del<S: AsRef<str>, W: io::Write>(&self, keys: &[S], writer: &mut W) -> io::Result<()> {
         let mut map = self.map.write();
 
-        RespData::Integer(
-            keys.iter()
-                .map(|k| map.remove(k.as_ref()).is_some())
-                .fold(0, |p, n| p + n as i64),
-        )
+        let num_removed = keys
+            .iter()
+            .map(|k| map.remove(k.as_ref()).is_some())
+            .fold(0, |p, n| p + n as i64);
+
+        write!(writer, "{}", RespData::Integer(num_removed))
     }
 
-    pub fn exists(&self, key: &str) -> RespData {
+    pub fn exists<W: io::Write>(&self, key: &str, writer: &mut W) -> io::Result<()> {
         let map = self.map.read();
 
-        RespData::Integer(map.contains_key(key) as i64)
-    }
-
-    fn ok() -> RespData {
-        RespData::SimpleString("OK".to_string())
-    }
-
-    fn wrongtype() -> RespData {
-        RespData::Error(
-            "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+        write!(
+            writer,
+            "{}",
+            RespData::Integer(map.contains_key(key) as i64)
         )
     }
 
-    fn out_of_range() -> RespData {
-        RespData::Error("ERR index out of range".to_string())
+    fn ok() -> SimpleStringRef<'static> {
+        SimpleStringRef("OK")
     }
 
-    fn no_such_key() -> RespData {
-        RespData::Error("ERR no such key".to_string())
+    fn wrongtype() -> ErrorRef<'static> {
+        ErrorRef("WRONGTYPE Operation against a key holding the wrong kind of value")
     }
 
-    fn rmw_integer<F: FnOnce(i64) -> i64, G: FnOnce() -> i64>(
+    fn out_of_range() -> ErrorRef<'static> {
+        ErrorRef("ERR index out of range")
+    }
+
+    fn no_such_key() -> ErrorRef<'static> {
+        ErrorRef("ERR no such key")
+    }
+
+    fn rmw_integer<W: io::Write, F: FnOnce(i64) -> i64, G: FnOnce() -> i64>(
         &self,
         key: String,
         if_present: F,
         if_absent: G,
-    ) -> RespData {
+        writer: &mut W,
+    ) -> io::Result<()> {
         let bucket_ptr = {
             let map = self.map.upgradable_read();
 
             if let Some(v) = map.get(&key) {
                 v.clone()
             } else {
-                let mut writer = RwLockUpgradableReadGuard::upgrade(map);
+                let mut map_writer = RwLockUpgradableReadGuard::upgrade(map);
 
-                match writer.entry(key) {
+                match map_writer.entry(key) {
                     Entry::Occupied(_) => unreachable!(), // should never happen, upgrade is atomic
                     Entry::Vacant(e) => {
                         let val = if_absent();
                         e.insert(Value::new(Value::String(format!("{}", val))));
 
-                        return RespData::Integer(val);
+                        return write!(writer, "{}", RespData::Integer(val));
                     }
                 }
             }
@@ -615,12 +674,16 @@ impl Database {
                 if let Ok(i) = s.parse::<i64>().map(if_present) {
                     *s = format!("{}", i);
 
-                    RespData::Integer(i)
+                    write!(writer, "{}", RespData::Integer(i))
                 } else {
-                    RespData::Error("ERR value is not an integer or out of range".to_string())
+                    write!(
+                        writer,
+                        "{}",
+                        ErrorRef("ERR value is not an integer or out of range")
+                    )
                 }
             }
-            _ => Database::wrongtype(),
+            _ => write!(writer, "{}", Database::wrongtype()),
         }
     }
 }

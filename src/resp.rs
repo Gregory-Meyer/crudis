@@ -23,6 +23,7 @@
 // SOFTWARE.
 
 use std::{
+    borrow::Cow,
     cmp::Eq,
     error::Error,
     fmt::{self, Display, Formatter},
@@ -33,15 +34,79 @@ use nom::{count, do_parse, map_res, named, peek, switch, tag, take, take_until_a
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
-    SimpleString(String),
-    Error(String),
+    SimpleString(Cow<'static, str>),
+    Error(Cow<'static, str>),
     Integer(i64),
-    BulkString(String),
+    BulkString(Cow<'static, str>),
     Nil,
     Array(Vec<RespData>),
 }
 
 impl Eq for RespData {}
+
+pub struct SimpleStringRef<'a>(pub &'a str);
+
+impl<'a> Display for SimpleStringRef<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "+{}\r\n", self.0)
+    }
+}
+
+pub struct ErrorRef<'a>(pub &'a str);
+
+impl<'a> Display for ErrorRef<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "-{}\r\n", self.0)
+    }
+}
+
+pub struct BulkStringRef<'a>(pub &'a str);
+
+impl<'a> Display for BulkStringRef<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        static PREFIXES: [&'static str; 33] = [
+            "$0\r\n",
+            "$1\r\n",
+            "$2\r\n",
+            "$3\r\n",
+            "$4\r\n",
+            "$5\r\n",
+            "$6\r\n",
+            "$7\r\n",
+            "$8\r\n",
+            "$9\r\n",
+            "$10\r\n",
+            "$11\r\n",
+            "$12\r\n",
+            "$13\r\n",
+            "$14\r\n",
+            "$15\r\n",
+            "$16\r\n",
+            "$17\r\n",
+            "$18\r\n",
+            "$19\r\n",
+            "$20\r\n",
+            "$21\r\n",
+            "$22\r\n",
+            "$23\r\n",
+            "$24\r\n",
+            "$25\r\n",
+            "$26\r\n",
+            "$27\r\n",
+            "$28\r\n",
+            "$29\r\n",
+            "$30\r\n",
+            "$31\r\n",
+            "$32\r\n",
+        ];
+
+        if self.0.len() < PREFIXES.len() {
+            write!(f, "{}{}\r\n", PREFIXES[self.0.len()], self.0)
+        } else {
+            write!(f, "${}\r\n{}\r\n", self.0.len(), self.0)
+        }
+    }
+}
 
 mod parse {
     use super::*;
@@ -51,12 +116,12 @@ mod parse {
 
     named!(simple_string<&str, RespData>, do_parse!(
         data: take_until_and_consume!("\r\n") >>
-        (RespData::SimpleString(data.into()))
+        (RespData::SimpleString(Cow::Owned(data.into())))
     ));
 
     named!(error<&str, RespData>, do_parse!(
         data: take_until_and_consume!("\r\n") >>
-        (RespData::Error(data.into()))
+        (RespData::Error(Cow::Owned(data.into())))
     ));
 
     named!(integer<&str, RespData>, do_parse!(
@@ -68,7 +133,7 @@ mod parse {
         len: map_res!(take_until_and_consume!("\r\n"), str::parse::<usize>) >>
         data: take!(len) >>
         tag!("\r\n") >>
-        (RespData::BulkString(data.into()))
+        (RespData::BulkString(Cow::Owned(data.into())))
     ));
 
     named!(nil<&str, RespData>, do_parse!(
@@ -181,10 +246,10 @@ impl Display for RespData {
         use RespData::*;
 
         match self {
-            SimpleString(s) => write!(f, "+{}\r\n", s),
-            Error(e) => write!(f, "-{}\r\n", e),
+            SimpleString(s) => SimpleStringRef(&s).fmt(f),
+            Error(e) => ErrorRef(&e).fmt(f),
             Integer(i) => write!(f, ":{}\r\n", i),
-            BulkString(i) => write!(f, "${}\r\n{}\r\n", i.len(), i),
+            BulkString(s) => BulkStringRef(&s).fmt(f),
             Nil => write!(f, "$-1\r\n"),
             Array(d) => {
                 write!(f, "*{}\r\n", d.len())?;
@@ -211,20 +276,22 @@ mod tests {
 
     #[test]
     fn fmt_simple_string() {
-        fmt_eq(&SimpleString("OK".to_string()), "+OK\r\n");
+        fmt_eq(&SimpleString(Cow::Borrowed("OK")), "+OK\r\n");
     }
 
     #[test]
     fn fmt_error() {
-        fmt_eq(&Error("Error message".to_string()), "-Error message\r\n");
+        fmt_eq(&Error(Cow::Borrowed("Error message")), "-Error message\r\n");
 
         fmt_eq(
-            &Error("ERR unknown command 'foobar'".to_string()),
+            &Error(Cow::Borrowed("ERR unknown command 'foobar'")),
             "-ERR unknown command 'foobar'\r\n",
         );
 
         fmt_eq(
-            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            &Error(Cow::Borrowed(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
             "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
         );
     }
@@ -240,9 +307,9 @@ mod tests {
 
     #[test]
     fn fmt_bulk_string() {
-        fmt_eq(&BulkString("foobar".to_string()), "$6\r\nfoobar\r\n");
+        fmt_eq(&BulkString(Cow::Borrowed("foobar")), "$6\r\nfoobar\r\n");
 
-        fmt_eq(&BulkString("".to_string()), "$0\r\n\r\n");
+        fmt_eq(&BulkString(Cow::Borrowed("")), "$0\r\n\r\n");
     }
 
     #[test]
@@ -256,8 +323,8 @@ mod tests {
 
         fmt_eq(
             &Array(vec![
-                BulkString("foo".to_string()),
-                BulkString("bar".to_string()),
+                BulkString(Cow::Borrowed("foo")),
+                BulkString(Cow::Borrowed("bar")),
             ]),
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
         );
@@ -273,24 +340,24 @@ mod tests {
                 Integer(2),
                 Integer(3),
                 Integer(4),
-                BulkString("foobar".to_string()),
+                BulkString(Cow::Borrowed("foobar")),
             ]),
             "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n",
         );
 
         fmt_eq(
             &Array(vec![
-                BulkString("foo".to_string()),
+                BulkString(Cow::Borrowed("foo")),
                 Nil,
-                BulkString("bar".to_string()),
+                BulkString(Cow::Borrowed("bar")),
             ]),
             "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n",
         );
 
         fmt_eq(
             &Array(vec![
-                BulkString("LLEN".to_string()),
-                BulkString("mylist".to_string()),
+                BulkString(Cow::Borrowed("LLEN")),
+                BulkString(Cow::Borrowed("mylist")),
             ]),
             "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n",
         )
@@ -302,21 +369,23 @@ mod tests {
 
     #[test]
     fn parse_simple_string() {
-        parse_eq("+OK\r\n", &SimpleString("OK".to_string()));
+        parse_eq("+OK\r\n", &SimpleString(Cow::Borrowed("OK")));
     }
 
     #[test]
     fn parse_error() {
-        parse_eq("-Error message\r\n", &Error("Error message".to_string()));
+        parse_eq("-Error message\r\n", &Error(Cow::Borrowed("Error message")));
 
         parse_eq(
             "-ERR unknown command 'foobar'\r\n",
-            &Error("ERR unknown command 'foobar'".to_string()),
+            &Error(Cow::Borrowed("ERR unknown command 'foobar'")),
         );
 
         parse_eq(
             "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-            &Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            &Error(Cow::Borrowed(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         );
     }
 
@@ -331,9 +400,9 @@ mod tests {
 
     #[test]
     fn parse_bulk_string() {
-        parse_eq("$6\r\nfoobar\r\n", &BulkString("foobar".to_string()));
+        parse_eq("$6\r\nfoobar\r\n", &BulkString(Cow::Borrowed("foobar")));
 
-        parse_eq("$0\r\n\r\n", &BulkString("".to_string()));
+        parse_eq("$0\r\n\r\n", &BulkString(Cow::Borrowed("")));
     }
 
     #[test]
@@ -348,8 +417,8 @@ mod tests {
         parse_eq(
             "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             &Array(vec![
-                BulkString("foo".to_string()),
-                BulkString("bar".to_string()),
+                BulkString(Cow::Borrowed("foo")),
+                BulkString(Cow::Borrowed("bar")),
             ]),
         );
 
@@ -365,24 +434,24 @@ mod tests {
                 Integer(2),
                 Integer(3),
                 Integer(4),
-                BulkString("foobar".to_string()),
+                BulkString(Cow::Borrowed("foobar")),
             ]),
         );
 
         parse_eq(
             "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n",
             &Array(vec![
-                BulkString("foo".to_string()),
+                BulkString(Cow::Borrowed("foo")),
                 Nil,
-                BulkString("bar".to_string()),
+                BulkString(Cow::Borrowed("bar")),
             ]),
         );
 
         parse_eq(
             "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n",
             &Array(vec![
-                BulkString("LLEN".to_string()),
-                BulkString("mylist".to_string()),
+                BulkString(Cow::Borrowed("LLEN")),
+                BulkString(Cow::Borrowed("mylist")),
             ]),
         )
     }
@@ -393,7 +462,7 @@ mod tests {
         let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
+        assert_eq!(parsed, vec![Cow::Borrowed("LLEN"), Cow::Borrowed("mylist")])
     }
 
     #[test]
@@ -402,6 +471,6 @@ mod tests {
         let (rest, parsed) = parse_client_message(msg).unwrap();
 
         assert!(rest.is_empty());
-        assert_eq!(parsed, vec!["LLEN".to_string(), "mylist".to_string()])
+        assert_eq!(parsed, vec![Cow::Borrowed("LLEN"), Cow::Borrowed("mylist")])
     }
 }
