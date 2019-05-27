@@ -26,11 +26,11 @@ use std::{
     cmp::Eq,
     error::Error,
     fmt::{self, Display, Formatter},
-    str::{self, FromStr, Utf8Error},
+    str::{self, FromStr},
     io::{self, Write},
 };
 
-use nom::{count, do_parse, map_res, named, peek, switch, tag, take, take_until_and_consume};
+use nom::{count, do_parse, map, map_res, named, peek, switch, tag, take, take_until_and_consume};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RespData {
@@ -43,6 +43,10 @@ pub enum RespData {
 }
 
 impl RespData {
+    pub fn ok() -> RespData {
+        RespData::SimpleString("OK".into())
+    }
+
     pub fn serialize(&self) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::with_capacity(self.serialized_len());
         self.write_to(&mut buffer)?;
@@ -166,15 +170,52 @@ mod parse {
     );
 } // mod parse
 
-fn split_trim(bytes: &[u8]) -> Result<Vec<&[u8]>, Utf8Error> {
-    Ok(str::from_utf8(bytes)?
-        .split_whitespace()
-        .map(|s| s.trim())
-        .map(|s| s.as_bytes())
-        .collect())
+fn split_trim(mut bytes: &[u8]) -> Vec<&[u8]> {
+    if let Some(idx) = bytes.iter().cloned().position(is_not_whitespace) {
+        bytes = &bytes[idx..];
+    } else {
+        return Vec::new();
+    }
+
+    let mut vec = Vec::new();
+
+    while !bytes.is_empty() {
+        let first_whitespace = bytes
+            .iter()
+            .cloned()
+            .position(is_whitespace)
+            .unwrap_or(bytes.len());
+
+        vec.push(&bytes[..first_whitespace]);
+        bytes = &bytes[first_whitespace..];
+
+        if let Some(i) = bytes
+            .iter()
+            .cloned()
+            .position(is_not_whitespace)
+        {
+            bytes = &bytes[i..];
+        } else {
+            bytes = &[];
+        }
+    }
+
+    vec
 }
 
-named!(pub parse_client_message<&[u8], Vec<&[u8]>>, switch!(peek!(take!(1)),
+fn is_not_whitespace(byte: u8) -> bool {
+    !is_whitespace(byte)
+}
+
+fn is_whitespace(byte: u8) -> bool {
+    // space, horizontal tab, line feed, form feed, or carriage return
+    match byte {
+        b' ' | b'\t' | 10 | 12 | b'\r' => true,
+        _ => false,
+    }
+}
+
+named!(pub parse_client_message<Vec<&[u8]>>, switch!(peek!(take!(1)),
     b"*" => do_parse!(
         tag!("*") >>
         len: map_res!(
@@ -199,7 +240,7 @@ named!(pub parse_client_message<&[u8], Vec<&[u8]>>, switch!(peek!(take!(1)),
         ), len) >>
         (elems)
     ) |
-    _ => map_res!(
+    _ => map!(
         take_until_and_consume!("\n"),
         split_trim
     )
@@ -473,5 +514,48 @@ mod tests {
 
         assert!(rest.is_empty());
         assert_eq!(parsed, vec!["LLEN".as_bytes(), "mylist".as_bytes()])
+    }
+
+    #[test]
+    fn split_trim_cases() {
+        assert_eq!(
+            split_trim("hello world!".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("   hello   world!   ".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("   hello   world!".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("hello   world!   ".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("   hello world!   ".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("   hello world!".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("hello   world!".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
+
+        assert_eq!(
+            split_trim("hello world!   ".as_bytes()),
+            vec!["hello".as_bytes(), "world!".as_bytes()]
+        );
     }
 }
