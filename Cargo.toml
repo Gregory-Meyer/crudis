@@ -6,6 +6,8 @@ edition = "2018"
 
 [dependencies]
 bytes = "0.4"
+crossbeam = "0.7"
+fxhash = "0.2"
 hashbrown = "0.3"
 jemallocator = "0.3"
 lazy_static = "1.3"

@@ -91,7 +91,7 @@ impl RespData {
         }
     }
 
-    fn serialized_len(&self) -> usize {
+    pub fn serialized_len(&self) -> usize {
         match self {
             RespData::SimpleString(s) | RespData::Error(s) => s.len() + 3,
             RespData::Integer(i) => {
