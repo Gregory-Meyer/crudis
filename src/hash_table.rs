@@ -22,20 +22,31 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::{collections::VecDeque, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    collections::VecDeque,
+    hash::{BuildHasher, Hash, Hasher},
+    sync::atomic::{AtomicUsize, Ordering}
+};
 
 use crossbeam::epoch::{self, Atomic, Guard, Owned, Shared};
+use fxhash::FxBuildHasher;
 
-pub struct HashTable {
+pub struct HashTable<H: BuildHasher> {
     buckets: Atomic<BucketArray>,
+    hasher: H,
 }
 
 const REDIRECT_TAG: usize = 1;
-const TOMBSTONE_TAG: usize = 2;
 
-impl HashTable {
-    pub fn new() -> HashTable {
-        HashTable{buckets: Atomic::new(BucketArray::with_capacity(8))}
+impl HashTable<FxBuildHasher> {
+    pub fn new() -> HashTable<FxBuildHasher> {
+        HashTable::with_hasher(FxBuildHasher::default())
+    }
+}
+
+impl<H: BuildHasher> HashTable<H> {
+    pub fn with_hasher(hasher: H) -> HashTable<H> {
+        HashTable{buckets: Atomic::new(BucketArray::with_capacity(8)), hasher}
     }
 
     // attempt to grow the hash table
@@ -49,83 +60,40 @@ impl HashTable {
     // 2. CAS the BucketArrays, if that fails we can abort because someone else
     //    resized the table
     fn grow(&self) -> bool {
-        let guard = &epoch::pin();
-
-        let buckets = self.buckets.load(Ordering::SeqCst, guard);
-        assert!(!buckets.is_null());
-
-        let buckets_ref = unsafe { buckets.deref() };
-        let new_buckets = Owned::new(BucketArray::with_capacity(buckets_ref.capacity() * 2)).into_shared(guard);
-        let new_buckets_ref = unsafe { new_buckets.deref() };
-
-        if !buckets_ref.next_array.compare_and_set(Shared::null(), new_buckets, Ordering::SeqCst, guard).is_ok() {
-            return false;
-        }
-
-        let null_redirect = Shared::null().with_tag(REDIRECT_TAG);
-
-        for bucket in buckets_ref.buckets.iter() {
-            let mut this_bucket = bucket.load(Ordering::SeqCst, guard);
-
-            loop {
-                if this_bucket.is_null() && this_bucket.tag() == REDIRECT_TAG {
-                    return false;
-                } else if this_bucket.is_null() {
-                    if let Err(e) = bucket.compare_and_set_weak(this_bucket, null_redirect, Ordering::SeqCst, guard) {
-                        this_bucket = e.current;
-
-                        continue;
-                    } else {
-                        break;
-                    }
-                }
-
-                let this_bucket_ref = unsafe { this_bucket.deref() };
-                let hash = fxhash::hash(&this_bucket_ref.key);
-                let insert_idx = new_buckets_ref.find_for_insert(hash, guard).unwrap();
-
-                new_buckets_ref.buckets[insert_idx].store(this_bucket, Ordering::SeqCst);
-
-                if let Err(e) = bucket.compare_and_set_weak(this_bucket, null_redirect, Ordering::SeqCst, guard) {
-                    this_bucket = e.current;
-                } else {
-                    break;
-                }
-            }
-
-        }
-
-        self.buckets.compare_and_set(buckets, new_buckets, Ordering::SeqCst, guard).is_ok()
+        unimplemented!()
     }
 
     // insert a (key, value) pair or overwrite one that exists
     // return true if the pair existed and was removed
-    fn insert_or_assign(&self, key: &[u8], value: Value) -> bool {
+    fn insert(&self, key: Vec<u8>, value: Value) -> bool {
         let guard = &epoch::pin();
 
-        let hash = fxhash::hash(&key);
-        let mut buckets = self.buckets.load(Ordering::SeqCst, guard);
+        let mut bucket = Owned::new(Bucket::new(key, value));
+
+        let hash = {
+            let mut hasher = self.hasher.build_hasher();
+            bucket.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let mut buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
 
         loop {
-            let buckets_ref = unsafe { buckets.deref() };
+            assert!(!buckets_ptr.is_null());
 
-            match buckets_ref.find_or_insert(key, hash, || value.clone(), guard) {
-                Ok((bucket, inserted)) => {
-                    if inserted {
-                        return true;
-                    }
+            let buckets_ref = unsafe { buckets_ptr.deref() };
 
-                    let bucket_ref = unsafe { bucket.deref() };
-                    bucket_ref.value.store(Owned::new(value), Ordering::SeqCst);
-
-                    return false;
+            match buckets_ref.insert(bucket, hash, guard) {
+                Ok(ptr) => return ptr.is_null(),
+                Err(InsertError::Redirect(b)) => {
+                    bucket = b;
+                    buckets_ptr = buckets_ref.next_array.load(Ordering::SeqCst, guard);
                 }
-                Err(FindError::Redirect) => {
-                    buckets = buckets_ref.next_array.load(Ordering::SeqCst, guard);
-                }
-                Err(FindError::Full) => {
+                Err(InsertError::Full(b)) => {
+                    bucket = b;
                     self.grow();
-                },
+                    buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
+                }
             }
         }
     }
@@ -139,13 +107,74 @@ impl HashTable {
     }
 
     // return a copy of a value in the table
-    fn get(&self, key: &[u8]) -> Value {
-        unimplemented!()
+    fn get(&self, key: &[u8]) -> Option<Value> {
+        let guard = &epoch::pin();
+
+        let hash = {
+            let mut hasher = self.hasher.build_hasher();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let mut buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
+
+        loop {
+            assert!(!buckets_ptr.is_null());
+
+            let buckets_ref = unsafe { buckets_ptr.deref() };
+
+            match buckets_ref.get(key, hash, guard) {
+                Ok(found_bucket_ptr) => {
+                    assert!(!found_bucket_ptr.is_null());
+
+                    let found_bucket_ref = unsafe { found_bucket_ptr.deref() };
+                    let value = found_bucket_ref.value.clone().unwrap();
+
+                    return Some(value);
+                }
+                Err(FindError::Redirect) => {
+                    buckets_ptr = buckets_ref.next_array.load(Ordering::SeqCst, guard);
+                }
+                Err(FindError::NotFound) => {
+                    return None;
+                }
+            }
+        }
     }
 
     // read a value, then use it
-    fn get_and<F: FnOnce(&Value)>(&self, key: &[u8], f: F) {
-        unimplemented!()
+    fn get_and<T, F: FnOnce(&Value) -> T>(&self, key: &[u8], f: F) -> Option<T> {
+        let guard = &epoch::pin();
+
+        let hash = {
+            let mut hasher = self.hasher.build_hasher();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let mut buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
+
+        loop {
+            assert!(!buckets_ptr.is_null());
+
+            let buckets_ref = unsafe { buckets_ptr.deref() };
+
+            match buckets_ref.get(key, hash, guard) {
+                Ok(found_bucket_ptr) => {
+                    assert!(!found_bucket_ptr.is_null());
+
+                    let found_bucket_ref = unsafe { found_bucket_ptr.deref() };
+
+                    return Some(f(found_bucket_ref.value.as_ref().unwrap()));
+                }
+                Err(FindError::Redirect) => {
+                    buckets_ptr = buckets_ref.next_array.load(Ordering::SeqCst, guard);
+                }
+                Err(FindError::NotFound) => {
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -157,68 +186,93 @@ struct BucketArray {
 
 enum FindError {
     Redirect,
-    Full
+    NotFound
 }
 
-impl<'a> BucketArray {
-    fn find_or_insert<F: Fn() -> Value>(&self, key: &[u8], hash: usize, default_fn: F, guard: &'a Guard) -> Result<(Shared<'a, Bucket>, bool), FindError> {
-        let mut bucket_index = hash & (self.buckets.len() - 1);
+enum InsertError {
+    Redirect(Owned<Bucket>),
+    Full(Owned<Bucket>),
+}
 
-        let mut count = 0;
-        let mut maybe_new_bucket = None;
+enum FindOrInsert<'g> {
+    Found(Shared<'g, Bucket>),
+    Inserted,
+}
 
-        while count < self.buckets.len() {
-            let this_bucket = self.buckets[bucket_index].load(Ordering::SeqCst, guard);
+impl<'g> BucketArray {
+    fn find_or_insert<F: Fn() -> Value>(&self, key: Vec<u8>, hash: u64, default_fn: F, guard: &'g Guard) -> Result<FindOrInsert<'g>, FindError> {
+        unimplemented!()
+    }
 
-            if this_bucket.is_null() {
-                if this_bucket.tag() == 0 {
-                    if maybe_new_bucket.is_none() {
-                        maybe_new_bucket.replace(Owned::new(Bucket{
-                            key: key.to_vec(),
-                            value: Atomic::new(default_fn())
-                        }));
-                    }
+    fn insert(&self, mut bucket: Owned<Bucket>, hash: u64, guard: &'g Guard) -> Result<Shared<'g, Bucket>, InsertError> {
+        let len = self.buckets.len();
+        let offset = (hash & (len - 1) as u64) as usize;
 
-                    match self.buckets[bucket_index].compare_and_set(
-                        this_bucket,
-                        maybe_new_bucket.take().unwrap(),
-                        Ordering::SeqCst,
-                        guard
-                    ) {
-                        Ok(b) => return Ok((b, true)),
+        for i in (0..self.buckets.len()).map(|x| (x + offset) & (len - 1)) {
+            let this_bucket = &self.buckets[i];
+            let mut this_bucket_ptr = this_bucket.load(Ordering::SeqCst, guard);
+
+            loop {
+                if this_bucket_ptr.is_null() {
+                    match this_bucket.compare_and_set_weak(this_bucket_ptr, bucket, Ordering::SeqCst, guard) {
+                        Ok(prev) => return Ok(prev),
                         Err(e) => {
-                            maybe_new_bucket.replace(e.new);
-
-                            continue;
+                            bucket = e.new;
+                            this_bucket_ptr = e.current;
                         }
-                    }
-                } else if this_bucket.tag() == REDIRECT_TAG {
-                    return Err(FindError::Redirect)
-                } else if this_bucket.tag() == TOMBSTONE_TAG { // keep looking
-                    count += 1;
-                    bucket_index += 1;
-                    if bucket_index == self.buckets.len() {
-                        bucket_index = 0;
-                    }
+                    };
+                } else {
+                    let this_bucket_ref = unsafe { this_bucket_ptr.deref() };
 
-                    continue;
+                    if *this_bucket_ref == *bucket {
+                        if this_bucket_ptr.tag() == REDIRECT_TAG {
+                            return Err(InsertError::Redirect(bucket));
+                        }
+
+                        match this_bucket.compare_and_set_weak(this_bucket_ptr, bucket, Ordering::SeqCst, guard) {
+                            Ok(prev) => return Ok(prev),
+                            Err(e) => {
+                                bucket = e.new;
+                                this_bucket_ptr = e.current;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
                 }
-            }
-
-            let this_bucket_ref = unsafe { this_bucket.deref() };
-
-            if this_bucket_ref.key == key {
-                return Ok((this_bucket, false))
-            }
-
-            count += 1;
-            bucket_index += 1;
-            if bucket_index == self.buckets.len() {
-                bucket_index = 0;
             }
         }
 
-        Err(FindError::Full)
+        Err(InsertError::Full(bucket))
+    }
+
+    fn get(&self, key: &[u8], hash: u64, guard: &'g Guard) -> Result<Shared<'g, Bucket>, FindError> {
+        let len = self.buckets.len();
+        let offset = (hash & (len - 1) as u64) as usize;
+
+        for i in (0..self.buckets.len()).map(|x| (x + offset) & (len - 1)) {
+            let this_bucket = &self.buckets[i];
+            let this_bucket_ptr = this_bucket.load(Ordering::SeqCst, guard);
+
+            if this_bucket_ptr.is_null() {
+                return Err(FindError::NotFound);
+            } else {
+                let this_bucket_ref = unsafe { this_bucket_ptr.deref() };
+
+                if *this_bucket_ref == *key {
+                    if this_bucket_ptr.tag() == REDIRECT_TAG {
+                        return Err(FindError::Redirect);
+                    }
+
+                    match this_bucket_ref.value {
+                        Some(_) => return Ok(this_bucket_ptr),
+                        None => return Err(FindError::NotFound),
+                    }
+                }
+            }
+        }
+
+        Err(FindError::NotFound)
     }
 }
 
@@ -230,32 +284,51 @@ impl BucketArray {
     fn capacity(&self) -> usize {
         self.buckets.len()
     }
-
-    fn find_for_insert(&self, hash: usize, guard: &Guard) -> Option<usize> {
-        let mut bucket_index = hash & (self.buckets.len() - 1);
-
-        for _ in 0..self.buckets.len() {
-            if self.buckets[bucket_index].load(Ordering::SeqCst, guard).is_null() {
-                return Some(bucket_index);
-            }
-
-            bucket_index += 1;
-            if bucket_index == self.buckets.len() {
-                bucket_index = 0;
-            }
-        }
-
-        None
-    }
 }
 
 struct Bucket {
     key: Vec<u8>,
-    value: Atomic<Value>,
+    value: Option<Value>,
+}
+
+impl Bucket {
+    fn new(key: Vec<u8>, value: Value) -> Bucket {
+        Bucket{key, value: Some(value)}
+    }
+
+    fn new_tombstone(key: Vec<u8>) -> Bucket {
+        Bucket{key, value: None}
+    }
+}
+
+impl Eq for Bucket { }
+
+impl PartialEq for Bucket {
+    fn eq(&self, other: &Bucket) -> bool {
+        self.key == other.key
+    }
+}
+
+impl PartialEq<Vec<u8>> for Bucket {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.key == *other
+    }
+}
+
+impl PartialEq<[u8]> for Bucket {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.key == other
+    }
+}
+
+impl Hash for Bucket {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+    }
 }
 
 #[derive(Clone)]
 enum Value {
     String(Vec<u8>),
-    List(VecDeque<String>),
+    List(VecDeque<String>), //TODO: use im::Vector here
 }
