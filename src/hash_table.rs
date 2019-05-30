@@ -25,6 +25,7 @@
 use std::{
     collections::VecDeque,
     hash::{BuildHasher, Hash, Hasher},
+    mem,
     sync::atomic::{AtomicUsize, Ordering}
 };
 
@@ -42,10 +43,18 @@ impl HashTable<FxBuildHasher> {
     pub fn new() -> HashTable<FxBuildHasher> {
         HashTable::with_hasher(FxBuildHasher::default())
     }
+
+    pub fn with_capacity(capacity: usize) -> HashTable<FxBuildHasher> {
+        HashTable::with_capacity_and_hasher(capacity, FxBuildHasher::default())
+    }
 }
 
 impl<H: BuildHasher> HashTable<H> {
     pub fn with_hasher(hasher: H) -> HashTable<H> {
+        HashTable::with_capacity_and_hasher(8, hasher)
+    }
+
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: H) -> HashTable<H> {
         HashTable{buckets: Atomic::new(BucketArray::with_capacity(8)), hasher}
     }
 
@@ -60,11 +69,45 @@ impl<H: BuildHasher> HashTable<H> {
     // 2. CAS the BucketArrays, if that fails we can abort because someone else
     //    resized the table
     fn grow(&self) -> bool {
-        unimplemented!()
+        let guard = &epoch::pin();
+        let current_buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
+
+        if current_buckets_ptr.is_null() {
+            unimplemented!()
+        }
+
+        let current_buckets_ref = unsafe { current_buckets_ptr.deref() };
+
+        if !current_buckets_ref.next_array.load(Ordering::SeqCst, guard).is_null() {
+            return false;
+        }
+
+        let new_bucket_ptr = Owned::new(BucketArray::with_capacity(2 * current_buckets_ref.buckets.len())).into_shared(guard);
+
+        if current_buckets_ref.next_array.compare_and_set(Shared::null(), new_bucket_ptr, Ordering::SeqCst, guard).is_err() {
+            return false;
+        }
+
+        'outer: for i in 0..current_buckets_ref.buckets.len() {
+            let this_bucket = &current_buckets_ref.buckets[i];
+            let mut this_bucket_ptr = this_bucket.load(Ordering::SeqCst, guard);
+
+            'inner: loop {
+                if this_bucket_ptr.is_null() {
+                    continue 'outer;
+                }
+
+                let this_bucket_ref = unsafe { this_bucket_ptr.deref() };
+
+                unimplemented!()
+            }
+        }
+
+        return self.buckets.compare_and_set(current_buckets_ptr, new_bucket_ptr, Ordering::SeqCst, guard).is_ok();
     }
 
     // insert a (key, value) pair or overwrite one that exists
-    // return true if the pair existed and was removed
+    // return true if a matching key existed and was overwritten
     fn insert(&self, key: Vec<u8>, value: Value) -> bool {
         let guard = &epoch::pin();
 
@@ -84,7 +127,15 @@ impl<H: BuildHasher> HashTable<H> {
             let buckets_ref = unsafe { buckets_ptr.deref() };
 
             match buckets_ref.insert(bucket, hash, guard) {
-                Ok(ptr) => return ptr.is_null(),
+                Ok(ptr) => {
+                    if ptr.is_null() {
+                        return false;
+                    }
+
+                    let removed_ref = unsafe { ptr.deref() };
+
+                    return removed_ref.value.is_some();
+                }
                 Err(InsertError::Redirect(b)) => {
                     bucket = b;
                     buckets_ptr = buckets_ref.next_array.load(Ordering::SeqCst, guard);
@@ -176,6 +227,34 @@ impl<H: BuildHasher> HashTable<H> {
             }
         }
     }
+
+    // remove the key matching a value
+    fn remove(&self, key: Vec<u8>) -> bool {
+        let guard = &epoch::pin();
+
+        let hash = {
+            let mut hasher = self.hasher.build_hasher();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let mut buckets_ptr = self.buckets.load(Ordering::SeqCst, guard);
+
+        loop {
+            assert!(!buckets_ptr.is_null());
+
+            let buckets_ref = unsafe { buckets_ptr.deref() };
+
+            match buckets_ref.remove(key, hash, guard) {
+                Ok(_) => return true,
+                Err(RemoveError::Redirect(k)) => {
+                    buckets_ptr = buckets_ref.next_array.load(Ordering::SeqCst, guard);
+                    key = k;
+                }
+                Err(RemoveError::NotFound) => return false,
+            }
+        }
+    }
 }
 
 struct BucketArray {
@@ -186,12 +265,17 @@ struct BucketArray {
 
 enum FindError {
     Redirect,
-    NotFound
+    NotFound,
 }
 
 enum InsertError {
     Redirect(Owned<Bucket>),
     Full(Owned<Bucket>),
+}
+
+enum RemoveError {
+    Redirect(Vec<u8>),
+    NotFound,
 }
 
 enum FindOrInsert<'g> {
@@ -200,22 +284,28 @@ enum FindOrInsert<'g> {
 }
 
 impl<'g> BucketArray {
-    fn find_or_insert<F: Fn() -> Value>(&self, key: Vec<u8>, hash: u64, default_fn: F, guard: &'g Guard) -> Result<FindOrInsert<'g>, FindError> {
-        unimplemented!()
-    }
-
     fn insert(&self, mut bucket: Owned<Bucket>, hash: u64, guard: &'g Guard) -> Result<Shared<'g, Bucket>, InsertError> {
         let len = self.buckets.len();
         let offset = (hash & (len - 1) as u64) as usize;
+
+        let mut have_seen_redirect = true;
 
         for i in (0..self.buckets.len()).map(|x| (x + offset) & (len - 1)) {
             let this_bucket = &self.buckets[i];
             let mut this_bucket_ptr = this_bucket.load(Ordering::SeqCst, guard);
 
             loop {
+                if this_bucket_ptr.tag() == REDIRECT_TAG {
+                    have_seen_redirect = true;
+                }
+
                 if this_bucket_ptr.is_null() {
+                    if this_bucket_ptr.tag() == REDIRECT_TAG {
+                        return Err(InsertError::Redirect(bucket));
+                    }
+
                     match this_bucket.compare_and_set_weak(this_bucket_ptr, bucket, Ordering::SeqCst, guard) {
-                        Ok(prev) => return Ok(prev),
+                        Ok(_) => return Ok(this_bucket_ptr),
                         Err(e) => {
                             bucket = e.new;
                             this_bucket_ptr = e.current;
@@ -230,7 +320,9 @@ impl<'g> BucketArray {
                         }
 
                         match this_bucket.compare_and_set_weak(this_bucket_ptr, bucket, Ordering::SeqCst, guard) {
-                            Ok(prev) => return Ok(prev),
+                            Ok(_) => {
+                                return Ok(this_bucket_ptr);
+                            }
                             Err(e) => {
                                 bucket = e.new;
                                 this_bucket_ptr = e.current;
@@ -243,7 +335,11 @@ impl<'g> BucketArray {
             }
         }
 
-        Err(InsertError::Full(bucket))
+        if have_seen_redirect {
+            Err(InsertError::Redirect(bucket))
+        } else {
+            Err(InsertError::Full(bucket))
+        }
     }
 
     fn get(&self, key: &[u8], hash: u64, guard: &'g Guard) -> Result<Shared<'g, Bucket>, FindError> {
@@ -274,7 +370,84 @@ impl<'g> BucketArray {
 
         Err(FindError::NotFound)
     }
+
+    fn remove(&self, key: Vec<u8>, hash: u64, guard: &'g Guard) -> Result<Shared<'g, Bucket>, RemoveError> {
+        let len = self.buckets.len();
+        let offset = (hash & (len - 1) as u64) as usize;
+
+        let mut maybe_key = Some(key);
+        let mut maybe_new_bucket: Option<Owned<Bucket>> = None;
+        let mut key_ref = maybe_key.as_ref().unwrap();
+
+        for i in (0..self.buckets.len()).map(|x| (x + offset) & (len - 1)) {
+            let this_bucket = &self.buckets[i];
+            let mut this_bucket_ptr = this_bucket.load(Ordering::SeqCst, guard);
+
+            loop {
+                if this_bucket_ptr.is_null() {
+                    break;
+                }
+
+                let this_bucket_ref = unsafe { this_bucket_ptr.deref() };
+
+                if *this_bucket_ref == *key_ref {
+                    if this_bucket_ptr.tag() == REDIRECT_TAG {
+                        match maybe_key {
+                            Some(k) => return Err(RemoveError::Redirect(k)),
+                            None => {
+                                let new_bucket_ptr = maybe_new_bucket.unwrap().into_box();
+                                let Bucket{key, value: _} = *new_bucket_ptr;
+
+                                return Err(RemoveError::Redirect(key));
+                            }
+                        }
+                    }
+
+                    if this_bucket_ref.value.is_none() {
+                        return Err(RemoveError::NotFound);
+                    }
+
+                    let new_bucket = match maybe_new_bucket.take() {
+                        Some(b) => b,
+                        None => Owned::new(Bucket::new_tombstone(maybe_key.take().unwrap())),
+                    };
+
+                    match this_bucket.compare_and_set_weak(this_bucket_ptr, new_bucket, Ordering::SeqCst, guard) {
+                        Ok(_) => return Ok(this_bucket_ptr),
+                        Err(e) => {
+                            maybe_new_bucket.replace(e.new);
+                            key_ref = &maybe_new_bucket.as_ref().unwrap().key;
+                            this_bucket_ptr = e.current;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Err(RemoveError::NotFound)
+    }
 }
+
+fn round_up_to_next_power_of_2(x: usize) -> usize {
+    if is_power_of_2(x) {
+        return x;
+    }
+
+    let first_set = (mem::size_of::<usize>() * 8) as u32 - x.leading_zeros();
+
+    return 1 << first_set;
+}
+
+fn is_power_of_2(x: usize) -> bool {
+    if x == 0 {
+        false
+    } else {
+        (x & (x - 1)) == 0
+    }
+}
+
 
 impl BucketArray {
     fn with_capacity(capacity: usize) -> BucketArray {
@@ -327,8 +500,70 @@ impl Hash for Bucket {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum Value {
     String(Vec<u8>),
     List(VecDeque<String>), //TODO: use im::Vector here
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert() {
+        let table = HashTable::new();
+
+        assert!(!table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+        assert!(table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+
+        assert!(!table.insert(b"bar".to_vec(), Value::String(b"bar".to_vec())));
+        assert!(table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+        assert!(table.insert(b"bar".to_vec(), Value::String(b"bar".to_vec())));
+
+        assert!(!table.insert(b"baz".to_vec(), Value::String(b"baz".to_vec())));
+        assert!(table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+        assert!(table.insert(b"bar".to_vec(), Value::String(b"bar".to_vec())));
+        assert!(table.insert(b"baz".to_vec(), Value::String(b"baz".to_vec())));
+
+        assert!(!table.insert(b"qux".to_vec(), Value::String(b"qux".to_vec())));
+        assert!(table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+        assert!(table.insert(b"bar".to_vec(), Value::String(b"bar".to_vec())));
+        assert!(table.insert(b"baz".to_vec(), Value::String(b"baz".to_vec())));
+        assert!(table.insert(b"qux".to_vec(), Value::String(b"qux".to_vec())));
+    }
+
+    #[test]
+    fn get() {
+        let table = HashTable::new();
+
+        assert!(table.get(b"foo").is_none());
+        assert!(table.get(b"bar").is_none());
+        assert!(table.get(b"baz").is_none());
+        assert!(table.get(b"qux").is_none());
+
+        assert!(!table.insert(b"foo".to_vec(), Value::String(b"foo".to_vec())));
+        assert_eq!(table.get(b"foo"), Some(Value::String(b"foo".to_vec())));
+        assert!(table.get(b"bar").is_none());
+        assert!(table.get(b"baz").is_none());
+        assert!(table.get(b"qux").is_none());
+
+        assert!(!table.insert(b"bar".to_vec(), Value::String(b"bar".to_vec())));
+        assert_eq!(table.get(b"foo"), Some(Value::String(b"foo".to_vec())));
+        assert_eq!(table.get(b"bar"), Some(Value::String(b"bar".to_vec())));
+        assert!(table.get(b"baz").is_none());
+        assert!(table.get(b"qux").is_none());
+
+        assert!(!table.insert(b"baz".to_vec(), Value::String(b"baz".to_vec())));
+        assert_eq!(table.get(b"foo"), Some(Value::String(b"foo".to_vec())));
+        assert_eq!(table.get(b"bar"), Some(Value::String(b"bar".to_vec())));
+        assert_eq!(table.get(b"baz"), Some(Value::String(b"baz".to_vec())));
+        assert!(table.get(b"qux").is_none());
+
+        assert!(!table.insert(b"qux".to_vec(), Value::String(b"qux".to_vec())));
+        assert_eq!(table.get(b"foo"), Some(Value::String(b"foo".to_vec())));
+        assert_eq!(table.get(b"bar"), Some(Value::String(b"bar".to_vec())));
+        assert_eq!(table.get(b"baz"), Some(Value::String(b"baz".to_vec())));
+        assert_eq!(table.get(b"qux"), Some(Value::String(b"qux".to_vec())));
+    }
 }
